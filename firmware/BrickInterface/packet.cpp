@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "packet.h"
+#include "act_led.h"
 
 void parserInit(PacketParser *p) {
     p->state = PARSE_WAIT_SOF;
@@ -71,6 +72,7 @@ void sendReply(uint8_t seq, uint8_t cmd,
     uint8_t buf[1 + 1 + 1 + 1 + PROTO_MAX_PAYLOAD + 1];
     uint8_t len = buildPacket(buf, seq, cmd, payload, payloadLen);
     Serial.write(buf, len);
+    actLedPulse();
 }
 
 void sendError(uint8_t seq, uint8_t errorCode, uint8_t detail) {

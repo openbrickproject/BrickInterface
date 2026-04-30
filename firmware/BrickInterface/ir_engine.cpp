@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include "ir_engine.h"
 #include "board_config.h"
+#include "protocol.h"
 
 // ============================================================
 // CH552T carrier control via PWM2 on P3.4
@@ -466,7 +467,7 @@ void irPoll(void) {
         state.active = IR_ACTIVE_PF;
         state.carrier_hz = 38000;
         state.duty_pct = 33;
-        pfBuildNibbles(state.pf.nibbles, pending.pf.channel, pending.pf.mode,
+        pfBuildNibbles((uint8_t *)state.pf.nibbles, pending.pf.channel, pending.pf.mode,
                        pending.pf.data, pending.pf.flags);
         state.pf.channel = pending.pf.channel;
         state.pf.repeat = 0;

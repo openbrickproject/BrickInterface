@@ -7,11 +7,16 @@
 //   - LEGO Legacy IR (76 kHz)
 //   - LEGO RCX IR (38 kHz)
 
+// USB CDC mode is selected via Arduino IDE Tools menu (boards.txt build flags),
+// not via sketch macros. The descriptor (VID 0x1209, PID 0xc550 — pid.codes/ch55xduino)
+// is hardcoded in the ch55xduino core and not user-overridable from the sketch.
+
 #include "board_config.h"
 #include "protocol.h"
 #include "packet.h"
 #include "ir_engine.h"
 #include "interface_a.h"
+#include "act_led.h"
 
 // --- Capabilities for this board ---
 #define DEVICE_CAPS (CAP_INTERFACE_A | CAP_PF_IR | CAP_LEGACY_IR | CAP_IR_DONE_EVENTS | CAP_RCX_IR)
@@ -35,6 +40,21 @@ static struct {
 
 // --- Packet parser ---
 static PacketParser parser;
+
+// --- Activity LED state (any-direction USB-CDC byte triggers a pulse) ---
+#define ACT_LED_DURATION_MS 30
+static unsigned long actLedOffMs = 0;
+
+void actLedPulse(void) {
+    digitalWrite(ACT_LED_PIN, HIGH);
+    actLedOffMs = millis() + ACT_LED_DURATION_MS;
+}
+
+void actLedTick(void) {
+    if (actLedOffMs && (long)(millis() - actLedOffMs) >= 0) {
+        actLedOffMs = 0;
+    }
+}
 
 // --- Forward declarations ---
 static void handlePacket(const Packet *pkt);
@@ -66,6 +86,7 @@ void loop() {
     // Parse incoming packets
     while (Serial.available()) {
         uint8_t b = Serial.read();
+        actLedPulse();
         parserConsume(&parser, b);
         if (parser.ready) {
             parser.ready = 0;
@@ -78,9 +99,9 @@ void loop() {
     if (irGetCompletion(&token, &engine)) {
         uint8_t payload[2] = { token, engine };
         sendReply(0x00, REPLY_IR_DONE, payload, 2);
-        digitalWrite(ACT_LED_PIN, LOW);
     }
 
+    actLedTick();
     processHolds();
     irPoll();
 }
@@ -166,7 +187,6 @@ static void handlePacket(const Packet *pkt) {
         uint8_t tok = irStartPF(pkt->payload[0], pkt->payload[1],
                                 pkt->payload[2], pkt->payload[3]);
         if (!tok) { sendError(pkt->seq, ERR_BUSY, 0); break; }
-        digitalWrite(ACT_LED_PIN, HIGH);
         uint8_t p[2] = { tok, IR_ENGINE_PF };
         sendReply(pkt->seq, REPLY_IR_ACCEPTED, p, 2);
         break;
@@ -211,7 +231,6 @@ static void handlePacket(const Packet *pkt) {
         }
         uint8_t tok = irStartLegacy(pkt->payload[0], pkt->payload[1], pkt->payload[2]);
         if (!tok) { sendError(pkt->seq, ERR_BUSY, 0); break; }
-        digitalWrite(ACT_LED_PIN, HIGH);
         uint8_t p[2] = { tok, IR_ENGINE_LEGACY };
         sendReply(pkt->seq, REPLY_IR_ACCEPTED, p, 2);
         break;
@@ -256,7 +275,6 @@ static void handlePacket(const Packet *pkt) {
         if ((pkt->payload_len - 1) > 16) { sendError(pkt->seq, ERR_BAD_ARGUMENT, 0); break; }
         uint8_t tok = irStartRCX(&pkt->payload[1], pkt->payload_len - 1, pkt->payload[0]);
         if (!tok) { sendError(pkt->seq, ERR_BUSY, 0); break; }
-        digitalWrite(ACT_LED_PIN, HIGH);
         uint8_t p[2] = { tok, IR_ENGINE_RCX };
         sendReply(pkt->seq, REPLY_IR_ACCEPTED, p, 2);
         break;
@@ -266,7 +284,6 @@ static void handlePacket(const Packet *pkt) {
         if (pkt->payload_len < 2) { sendError(pkt->seq, ERR_BAD_LENGTH, 0); break; }
         uint8_t tok = irStartRCXRaw(&pkt->payload[1], pkt->payload_len - 1, pkt->payload[0]);
         if (!tok) { sendError(pkt->seq, ERR_BUSY, 0); break; }
-        digitalWrite(ACT_LED_PIN, HIGH);
         uint8_t p[2] = { tok, IR_ENGINE_RCX };
         sendReply(pkt->seq, REPLY_IR_ACCEPTED, p, 2);
         break;
@@ -279,7 +296,6 @@ static void handlePacket(const Packet *pkt) {
             pfHolds[i].active = 0;
             legacyHolds[i].active = 0;
         }
-        digitalWrite(ACT_LED_PIN, LOW);
         sendReply(pkt->seq, REPLY_OK, NULL, 0);
         break;
 
@@ -299,8 +315,7 @@ static void processHolds(void) {
         if (irStartPF(pfHolds[i].channel, pfHolds[i].mode,
                        pfHolds[i].data, pfHolds[i].flags)) {
             pfHolds[i].lastSentMs = now;
-            digitalWrite(ACT_LED_PIN, HIGH);
-        }
+            }
     }
 
     for (uint8_t i = 0; i < 4; i++) {
@@ -316,8 +331,7 @@ static void processHolds(void) {
         if (irStartLegacy(legacyHolds[i].channelCode,
                           legacyHolds[i].orange, legacyHolds[i].yellow)) {
             legacyHolds[i].lastSentMs = now;
-            digitalWrite(ACT_LED_PIN, HIGH);
-        }
+            }
     }
 }
 
@@ -346,7 +360,6 @@ static void doResetState(void) {
         legacyHolds[i].active = 0;
     }
     pfToggle[0] = pfToggle[1] = pfToggle[2] = pfToggle[3] = 0;
-    digitalWrite(ACT_LED_PIN, LOW);
 }
 
 // ============================================================
@@ -362,5 +375,7 @@ static void enterBootloader(void) {
     UDEV_CTRL = 0;       // detach from bus
     delay(100);          // let host see the disconnect
     EA = 0;              // disable all interrupts
+#ifdef __SDCC
     __asm__("ljmp #0x3800");
+#endif
 }
