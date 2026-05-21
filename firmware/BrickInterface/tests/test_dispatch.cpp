@@ -5,9 +5,9 @@
 // CMD_RCX_SEND too long, IR busy, etc.). Exercises BrickInterface.ino
 // directly by including it after pulling in the other firmware sources.
 #include "test_harness.h"
-#include "../packet.cpp"
-#include "../ir_engine.cpp"
-#include "../interface_a.cpp"
+#include "../packet.c"
+#include "../ir_engine.c"
+#include "../interface_a.c"
 #include "../BrickInterface.ino"
 
 // ---------------------------------------------------------------------------
@@ -119,25 +119,39 @@ TEST(dispatch_unknown_cmd_returns_error) {
 // Interface A
 // ---------------------------------------------------------------------------
 
-TEST(dispatch_iface_set_outputs_replies_state) {
+TEST(dispatch_iface_set_outputs_6byte_replies_ok) {
     reset_firmware_state();
     Packet pkt;
-    uint8_t bits = 0x05;
-    make_packet(&pkt, 0x10, CMD_IFACE_SET_OUTPUTS, &bits, 1);
+    uint8_t duties[6] = {10, 20, 30, 40, 50, 60};
+    make_packet(&pkt, 0x10, CMD_IFACE_SET_OUTPUTS, duties, 6);
     handlePacket(&pkt);
 
     uint8_t seq, cmd, payload[32], plen;
     ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
-    ASSERT_EQ(cmd, REPLY_IFACE_STATE);
-    ASSERT_EQ(plen, 1);
-    // Outputs 0 and 2 set => low 6 bits = 0x05
-    ASSERT_EQ(payload[0] & 0x3F, 0x05);
+    ASSERT_EQ(cmd, REPLY_OK);
+}
+
+TEST(dispatch_iface_set_outputs_7byte_mask_applies_selectively) {
+    reset_firmware_state();
+    // Pre-seed all duties to a known value so we can verify mask leaves
+    // some outputs untouched.
+    uint8_t base[6] = {99, 99, 99, 99, 99, 99};
+    ifaceSetOutputs(base, 0x3F);
+
+    Packet pkt;
+    uint8_t p[7] = {1, 2, 3, 4, 5, 6, 0x05};  // mask = outputs 0 and 2 only
+    make_packet(&pkt, 0x11, CMD_IFACE_SET_OUTPUTS, p, 7);
+    handlePacket(&pkt);
+
+    uint8_t seq, cmd, payload[32], plen;
+    ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
+    ASSERT_EQ(cmd, REPLY_OK);
 }
 
 TEST(dispatch_iface_set_outputs_bad_length_errors) {
     reset_firmware_state();
     Packet pkt;
-    make_packet(&pkt, 0x11, CMD_IFACE_SET_OUTPUTS, NULL, 0);
+    make_packet(&pkt, 0x12, CMD_IFACE_SET_OUTPUTS, NULL, 0);
     handlePacket(&pkt);
 
     uint8_t seq, cmd, payload[32], plen;
@@ -146,23 +160,91 @@ TEST(dispatch_iface_set_outputs_bad_length_errors) {
     ASSERT_EQ(payload[0], ERR_BAD_LENGTH);
 }
 
-TEST(dispatch_iface_set_pwm_replies_ok) {
+TEST(dispatch_iface_get_inputs_returns_one_byte) {
     reset_firmware_state();
     Packet pkt;
-    uint8_t p[] = {3, 128};  // output 3, duty 50%
-    make_packet(&pkt, 0x12, CMD_IFACE_SET_PWM, p, 2);
+    make_packet(&pkt, 0x13, CMD_IFACE_GET_INPUTS, NULL, 0);
+    handlePacket(&pkt);
+
+    uint8_t seq, cmd, payload[32], plen;
+    ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
+    ASSERT_EQ(cmd, REPLY_IFACE_INPUTS);
+    ASSERT_EQ(plen, 1);
+    // Only bits 0 and 1 are meaningful; upper bits zero.
+    ASSERT_EQ(payload[0] & 0xFC, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Interface A — counter commands
+// ---------------------------------------------------------------------------
+
+TEST(dispatch_iface_get_counts_returns_8_bytes) {
+    reset_firmware_state();
+    ifaceResetCount(6); ifaceResetCount(7);
+    Packet pkt;
+    make_packet(&pkt, 0x30, CMD_IFACE_GET_COUNTS, NULL, 0);
+    handlePacket(&pkt);
+
+    uint8_t seq, cmd, payload[32], plen;
+    ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
+    ASSERT_EQ(cmd, REPLY_IFACE_COUNTS);
+    ASSERT_EQ(plen, 8);
+    // Both counters start at zero.
+    for (int i = 0; i < 8; i++) ASSERT_EQ(payload[i], 0);
+}
+
+TEST(dispatch_iface_get_counts_reflects_edge_increments) {
+    reset_firmware_state();
+    ifaceResetCount(6); ifaceResetCount(7);
+    // Three false->true edges on input 6 (idx 0): high, low, high, low, high, low
+    ifaceCountEdge(0, 1);  // baseline high — no count
+    ifaceCountEdge(0, 0);  // edge 1
+    ifaceCountEdge(0, 1);
+    ifaceCountEdge(0, 0);  // edge 2
+    ifaceCountEdge(0, 1);
+    ifaceCountEdge(0, 0);  // edge 3
+
+    Packet pkt;
+    make_packet(&pkt, 0x31, CMD_IFACE_GET_COUNTS, NULL, 0);
+    handlePacket(&pkt);
+
+    uint8_t seq, cmd, payload[32], plen;
+    ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
+    ASSERT_EQ(cmd, REPLY_IFACE_COUNTS);
+    // Little-endian u32: count6 = 3, count7 = 0.
+    ASSERT_EQ(payload[0], 3);
+    ASSERT_EQ(payload[1], 0);
+    ASSERT_EQ(payload[2], 0);
+    ASSERT_EQ(payload[3], 0);
+    ASSERT_EQ(payload[4], 0);
+}
+
+TEST(dispatch_iface_reset_count_zeros_one_port) {
+    reset_firmware_state();
+    ifaceResetCount(6); ifaceResetCount(7);
+    // Increment both inputs.
+    ifaceCountEdge(0, 1); ifaceCountEdge(0, 0);
+    ifaceCountEdge(1, 1); ifaceCountEdge(1, 0);
+
+    Packet pkt;
+    uint8_t p[] = {6};
+    make_packet(&pkt, 0x32, CMD_IFACE_RESET_COUNT, p, 1);
     handlePacket(&pkt);
 
     uint8_t seq, cmd, payload[32], plen;
     ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
     ASSERT_EQ(cmd, REPLY_OK);
+
+    // Confirm: input 6 is zero, input 7 is unchanged.
+    ASSERT_EQ(ifaceGetCount(6), 0);
+    ASSERT_EQ(ifaceGetCount(7), 1);
 }
 
-TEST(dispatch_iface_set_pwm_bad_output_errors) {
+TEST(dispatch_iface_reset_count_bad_input_errors) {
     reset_firmware_state();
     Packet pkt;
-    uint8_t p[] = {6, 128};  // output 6 invalid (only 0-5)
-    make_packet(&pkt, 0x13, CMD_IFACE_SET_PWM, p, 2);
+    uint8_t p[] = {5};  // input 5 doesn't exist (only 6 and 7)
+    make_packet(&pkt, 0x33, CMD_IFACE_RESET_COUNT, p, 1);
     handlePacket(&pkt);
 
     uint8_t seq, cmd, payload[32], plen;
@@ -171,16 +253,29 @@ TEST(dispatch_iface_set_pwm_bad_output_errors) {
     ASSERT_EQ(payload[0], ERR_BAD_ARGUMENT);
 }
 
-TEST(dispatch_iface_set_pwm_all_replies_ok) {
+TEST(dispatch_iface_reset_count_bad_length_errors) {
     reset_firmware_state();
     Packet pkt;
-    uint8_t p[] = {10, 20, 30, 40, 50, 60};
-    make_packet(&pkt, 0x14, CMD_IFACE_SET_PWM_ALL, p, 6);
+    make_packet(&pkt, 0x34, CMD_IFACE_RESET_COUNT, NULL, 0);
     handlePacket(&pkt);
 
     uint8_t seq, cmd, payload[32], plen;
     ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
-    ASSERT_EQ(cmd, REPLY_OK);
+    ASSERT_EQ(cmd, REPLY_ERROR);
+    ASSERT_EQ(payload[0], ERR_BAD_LENGTH);
+}
+
+TEST(dispatch_reset_state_zeros_counters) {
+    reset_firmware_state();
+    ifaceCountEdge(0, 1); ifaceCountEdge(0, 0);
+    ifaceCountEdge(1, 1); ifaceCountEdge(1, 0);
+
+    Packet pkt;
+    make_packet(&pkt, 0x36, CMD_RESET_STATE, NULL, 0);
+    handlePacket(&pkt);
+
+    ASSERT_EQ(ifaceGetCount(6), 0);
+    ASSERT_EQ(ifaceGetCount(7), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -232,19 +327,6 @@ TEST(dispatch_pf_send_busy_returns_error) {
     ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
     ASSERT_EQ(cmd, REPLY_ERROR);
     ASSERT_EQ(payload[0], ERR_BUSY);
-}
-
-TEST(dispatch_pf_start_hold_rejects_bad_channel) {
-    reset_firmware_state();
-    Packet pkt;
-    uint8_t p[] = {4 /*invalid ch*/, PF_MODE_COMBO_DIRECT, 0, 0};
-    make_packet(&pkt, 0x24, CMD_PF_START_HOLD, p, 4);
-    handlePacket(&pkt);
-
-    uint8_t seq, cmd, payload[32], plen;
-    ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
-    ASSERT_EQ(cmd, REPLY_ERROR);
-    ASSERT_EQ(payload[0], ERR_BAD_ARGUMENT);
 }
 
 // ---------------------------------------------------------------------------

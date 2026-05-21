@@ -21,23 +21,6 @@
 // --- Capabilities for this board ---
 #define DEVICE_CAPS (CAP_INTERFACE_A | CAP_PF_IR | CAP_LEGACY_IR | CAP_IR_DONE_EVENTS | CAP_RCX_IR)
 
-// --- Hold state for PF ---
-static struct {
-    uint8_t active;
-    uint8_t channel, mode, data, flags;
-    unsigned long lastSentMs;
-} pfHolds[4];
-
-// --- Hold state for Legacy ---
-static struct {
-    uint8_t active;
-    uint8_t channelCode, orange, yellow;
-    unsigned long lastSentMs;
-} legacyHolds[4];
-
-// PF hold repeat interval (ms)
-#define PF_HOLD_INTERVAL_MS  200
-
 // --- Packet parser ---
 static PacketParser parser;
 
@@ -52,58 +35,109 @@ void actLedPulse(void) {
 
 void actLedTick(void) {
     if (actLedOffMs && (long)(millis() - actLedOffMs) >= 0) {
+        digitalWrite(ACT_LED_PIN, LOW);
         actLedOffMs = 0;
     }
 }
 
 // --- Forward declarations ---
 static void handlePacket(const Packet *pkt);
-static void processHolds(void);
 static void doResetState(void);
 static void enterBootloader(void);
 static uint8_t isValidPFMode(uint8_t mode);
 static uint8_t isValidLegacyNibble(uint8_t value);
 
 // ============================================================
+// Timer 2 ISR — software PWM driver for the 6 Interface A outputs.
+//
+// We use Timer 2 because ch55xduino's main.c declares the Timer 2 vector
+// (pointing to a weak Timer2Interrupt symbol). Defining Timer2Interrupt
+// in the sketch overrides the core's empty weak version at link time.
+// SDCC only installs interrupt vectors in the translation unit containing
+// main(), and main() lives in ch55xduino/cores/.../main.c — not in our .ino —
+// so we cannot install a Timer 1 vector from user code.
+void Timer2Interrupt(void) __interrupt {
+    TF2 = 0;  // clear Timer 2 overflow flag (not auto-cleared)
+
+    uint8_t c = pwmCounter++;
+    P1_4 = (c < pwmDuty[0]) ? 1 : 0;  // OUT0
+    P1_5 = (c < pwmDuty[1]) ? 1 : 0;  // OUT1
+    P1_6 = (c < pwmDuty[2]) ? 1 : 0;  // OUT2
+    P1_7 = (c < pwmDuty[3]) ? 1 : 0;  // OUT3
+    P3_1 = (c < pwmDuty[4]) ? 1 : 0;  // OUT4
+    P3_0 = (c < pwmDuty[5]) ? 1 : 0;  // OUT5
+}
+
+// ============================================================
 void setup() {
-    Serial.begin(115200);
+    // USB CDC needs no setup — ch55xduino brings it up automatically when
+    // the "Default CDC" USB Settings option is selected. Baud rate is
+    // meaningless on USB CDC.
 
     pinMode(ACT_LED_PIN, OUTPUT);
     digitalWrite(ACT_LED_PIN, LOW);
 
     ifaceInit();
-    irInit();
-    parserInit(&parser);
-
-    for (uint8_t i = 0; i < 4; i++) {
-        pfHolds[i].active = 0;
-        legacyHolds[i].active = 0;
-    }
+    // irInit();
+    // parserInit(&parser);
 }
 
 // ============================================================
 void loop() {
-    // Parse incoming packets
-    while (Serial.available()) {
-        uint8_t b = Serial.read();
-        actLedPulse();
-        parserConsume(&parser, b);
-        if (parser.ready) {
-            parser.ready = 0;
-            handlePacket(&parser.pkt);
-        }
-    }
+    // // Parse incoming packets
+    // while (USBSerial_available()) {
+    //     uint8_t b = USBSerial_read();
+    //     actLedPulse();
+    //     parserConsume(&parser, b);
+    //     if (parser.ready) {
+    //         parser.ready = 0;
+    //         handlePacket(&parser.pkt);
+    //     }
+    // }
+    //
+    // // IR completion events
+    // uint8_t token, engine;
+    // if (irGetCompletion(&token, &engine)) {
+    //     uint8_t payload[2] = { token, engine };
+    //     sendReply(0x00, REPLY_IR_DONE, payload, 2);
+    // }
+    //
+    // actLedTick();
+    // irPoll();
+    // ifaceEdgePoll();
 
-    // IR completion events
-    uint8_t token, engine;
-    if (irGetCompletion(&token, &engine)) {
-        uint8_t payload[2] = { token, engine };
-        sendReply(0x00, REPLY_IR_DONE, payload, 2);
-    }
+    // // ISR-BYPASS TEST: directly toggle output 0 without using PWM ISR.
+    // // If output 0 toggles 2s/2s: pin is driveable, ISR is the problem.
+    // // If output 0 stays on: something else is wrong (pinMode / pin mapping).
+    // digitalWrite(IFACE_OUT0_PIN, HIGH);
+    // digitalWrite(ACT_LED_PIN, HIGH);
+    // delay(2000);
+    // digitalWrite(IFACE_OUT0_PIN, LOW);
+    // digitalWrite(ACT_LED_PIN, LOW);
+    // delay(2000);
 
-    actLedTick();
-    processHolds();
-    irPoll();
+    static uint8_t duties[6] = {0, 0, 0, 0, 0, 0};
+    for (uint8_t i = 0; i < 6; i++) {
+        duties[i] = 255;
+        ifaceSetOutputs(duties, 0x3F);
+        digitalWrite(ACT_LED_PIN, HIGH);
+        delay(2000);
+        duties[i] = 0;
+        ifaceSetOutputs(duties, 0x3F);
+        digitalWrite(ACT_LED_PIN, LOW);
+        delay(2000);
+    }
+    // static uint8_t duties[6] = {0, 0, 0, 0, 0, 0};
+    // for (uint8_t i = 0; i < 6; i++) {
+    //     duties[i] = 255;
+    //     ifaceSetOutputs(duties, 0x3F);
+    //     digitalWrite(ACT_LED_PIN, HIGH);
+    //     delay(2000);
+    //     duties[i] = 0;
+    //     ifaceSetOutputs(duties, 0x3F);
+    //     digitalWrite(ACT_LED_PIN, LOW);
+    //     delay(2000);
+    // }
 }
 
 // ============================================================
@@ -138,44 +172,46 @@ static void handlePacket(const Packet *pkt) {
 
     case CMD_ENTER_BOOTLOADER:
         sendReply(pkt->seq, REPLY_OK, NULL, 0);
-        Serial.flush();  // block until USB IN ACK from host
+        USBSerial_flush();  // block until USB IN ACK from host
         enterBootloader();
         break;
 
     // --- Interface A ---
     case CMD_IFACE_SET_OUTPUTS: {
-        if (pkt->payload_len != 1) { sendError(pkt->seq, ERR_BAD_LENGTH, 0); break; }
-        ifaceSetOutputs(pkt->payload[0]);
-        uint8_t s = ifaceGetState();
-        sendReply(pkt->seq, REPLY_IFACE_STATE, &s, 1);
-        break;
-    }
-
-    case CMD_IFACE_GET_STATE: {
-        uint8_t s = ifaceGetState();
-        sendReply(pkt->seq, REPLY_IFACE_STATE, &s, 1);
-        break;
-    }
-
-    case CMD_IFACE_SET_OUT_MASK: {
-        if (pkt->payload_len != 2) { sendError(pkt->seq, ERR_BAD_LENGTH, 0); break; }
-        ifaceSetOutputMask(pkt->payload[0], pkt->payload[1]);
-        uint8_t s = ifaceGetState();
-        sendReply(pkt->seq, REPLY_IFACE_STATE, &s, 1);
-        break;
-    }
-
-    case CMD_IFACE_SET_PWM: {
-        if (pkt->payload_len != 2) { sendError(pkt->seq, ERR_BAD_LENGTH, 0); break; }
-        if (pkt->payload[0] >= 6) { sendError(pkt->seq, ERR_BAD_ARGUMENT, 0); break; }
-        ifaceSetPWM(pkt->payload[0], pkt->payload[1]);
+        if (pkt->payload_len != 6 && pkt->payload_len != 7) {
+            sendError(pkt->seq, ERR_BAD_LENGTH, 0); break;
+        }
+        uint8_t mask = (pkt->payload_len == 7) ? pkt->payload[6] : 0x3F;
+        ifaceSetOutputs(pkt->payload, mask);
         sendReply(pkt->seq, REPLY_OK, NULL, 0);
         break;
     }
 
-    case CMD_IFACE_SET_PWM_ALL: {
-        if (pkt->payload_len != 6) { sendError(pkt->seq, ERR_BAD_LENGTH, 0); break; }
-        ifaceSetPWMAll(pkt->payload);
+    case CMD_IFACE_GET_INPUTS: {
+        uint8_t s = ifaceSampleInputs();
+        sendReply(pkt->seq, REPLY_IFACE_INPUTS, &s, 1);
+        break;
+    }
+
+    case CMD_IFACE_GET_COUNTS: {
+        uint32_t c6 = ifaceGetCount(6);
+        uint32_t c7 = ifaceGetCount(7);
+        uint8_t p[8];
+        p[0] = (uint8_t)(c6      ); p[1] = (uint8_t)(c6 >>  8);
+        p[2] = (uint8_t)(c6 >> 16); p[3] = (uint8_t)(c6 >> 24);
+        p[4] = (uint8_t)(c7      ); p[5] = (uint8_t)(c7 >>  8);
+        p[6] = (uint8_t)(c7 >> 16); p[7] = (uint8_t)(c7 >> 24);
+        sendReply(pkt->seq, REPLY_IFACE_COUNTS, p, 8);
+        break;
+    }
+
+    case CMD_IFACE_RESET_COUNT: {
+        if (pkt->payload_len != 1) { sendError(pkt->seq, ERR_BAD_LENGTH, 0); break; }
+        if (pkt->payload[0] != 6 && pkt->payload[0] != 7) {
+            sendError(pkt->seq, ERR_BAD_ARGUMENT, 0);
+            break;
+        }
+        ifaceResetCount(pkt->payload[0]);
         sendReply(pkt->seq, REPLY_OK, NULL, 0);
         break;
     }
@@ -192,36 +228,6 @@ static void handlePacket(const Packet *pkt) {
         break;
     }
 
-    case CMD_PF_START_HOLD: {
-        if (pkt->payload_len != 4) { sendError(pkt->seq, ERR_BAD_LENGTH, 0); break; }
-        uint8_t ch = pkt->payload[0];
-        if (ch > 3) { sendError(pkt->seq, ERR_BAD_ARGUMENT, 0); break; }
-        if (!isValidPFMode(pkt->payload[1])) { sendError(pkt->seq, ERR_BAD_ARGUMENT, 0); break; }
-        pfHolds[ch].active = 1;
-        pfHolds[ch].channel = ch;
-        pfHolds[ch].mode = pkt->payload[1];
-        pfHolds[ch].data = pkt->payload[2];
-        pfHolds[ch].flags = pkt->payload[3];
-        pfHolds[ch].lastSentMs = 0;
-        uint8_t p[2] = { irNextToken(), IR_ENGINE_PF };
-        sendReply(pkt->seq, REPLY_IR_ACCEPTED, p, 2);
-        break;
-    }
-
-    case CMD_PF_STOP_HOLD: {
-        if (pkt->payload_len != 1) { sendError(pkt->seq, ERR_BAD_LENGTH, 0); break; }
-        uint8_t ch = pkt->payload[0];
-        if (ch > 3) { sendError(pkt->seq, ERR_BAD_ARGUMENT, 0); break; }
-        pfHolds[ch].active = 0;
-        sendReply(pkt->seq, REPLY_OK, NULL, 0);
-        break;
-    }
-
-    case CMD_PF_STOP_ALL:
-        for (uint8_t i = 0; i < 4; i++) pfHolds[i].active = 0;
-        sendReply(pkt->seq, REPLY_OK, NULL, 0);
-        break;
-
     // --- Legacy ---
     case CMD_LEGACY_SEND: {
         if (pkt->payload_len != 3) { sendError(pkt->seq, ERR_BAD_LENGTH, 0); break; }
@@ -235,39 +241,6 @@ static void handlePacket(const Packet *pkt) {
         sendReply(pkt->seq, REPLY_IR_ACCEPTED, p, 2);
         break;
     }
-
-    case CMD_LEGACY_START_HOLD: {
-        if (pkt->payload_len != 3) { sendError(pkt->seq, ERR_BAD_LENGTH, 0); break; }
-        uint8_t ch = pkt->payload[0];
-        if (ch < 4 || ch > 7) { sendError(pkt->seq, ERR_BAD_ARGUMENT, 0); break; }
-        if (!isValidLegacyNibble(pkt->payload[1]) || !isValidLegacyNibble(pkt->payload[2])) {
-            sendError(pkt->seq, ERR_BAD_ARGUMENT, 0);
-            break;
-        }
-        uint8_t idx = ch - 4;
-        legacyHolds[idx].active = 1;
-        legacyHolds[idx].channelCode = ch;
-        legacyHolds[idx].orange = pkt->payload[1];
-        legacyHolds[idx].yellow = pkt->payload[2];
-        legacyHolds[idx].lastSentMs = 0;
-        uint8_t p[2] = { irNextToken(), IR_ENGINE_LEGACY };
-        sendReply(pkt->seq, REPLY_IR_ACCEPTED, p, 2);
-        break;
-    }
-
-    case CMD_LEGACY_STOP_HOLD: {
-        if (pkt->payload_len != 1) { sendError(pkt->seq, ERR_BAD_LENGTH, 0); break; }
-        uint8_t ch = pkt->payload[0];
-        if (ch < 4 || ch > 7) { sendError(pkt->seq, ERR_BAD_ARGUMENT, 0); break; }
-        legacyHolds[ch - 4].active = 0;
-        sendReply(pkt->seq, REPLY_OK, NULL, 0);
-        break;
-    }
-
-    case CMD_LEGACY_STOP_ALL:
-        for (uint8_t i = 0; i < 4; i++) legacyHolds[i].active = 0;
-        sendReply(pkt->seq, REPLY_OK, NULL, 0);
-        break;
 
     // --- RCX ---
     case CMD_RCX_SEND: {
@@ -292,46 +265,12 @@ static void handlePacket(const Packet *pkt) {
     // --- IR abort ---
     case CMD_IR_ABORT_ALL:
         irAbortAll();
-        for (uint8_t i = 0; i < 4; i++) {
-            pfHolds[i].active = 0;
-            legacyHolds[i].active = 0;
-        }
         sendReply(pkt->seq, REPLY_OK, NULL, 0);
         break;
 
     default:
         sendError(pkt->seq, ERR_UNKNOWN_CMD, 0);
         break;
-    }
-}
-
-// ============================================================
-static void processHolds(void) {
-    unsigned long now = millis();
-
-    for (uint8_t i = 0; i < 4; i++) {
-        if (!pfHolds[i].active) continue;
-        if (now - pfHolds[i].lastSentMs < PF_HOLD_INTERVAL_MS) continue;
-        if (irStartPF(pfHolds[i].channel, pfHolds[i].mode,
-                       pfHolds[i].data, pfHolds[i].flags)) {
-            pfHolds[i].lastSentMs = now;
-            }
-    }
-
-    for (uint8_t i = 0; i < 4; i++) {
-        if (!legacyHolds[i].active) continue;
-        uint16_t interval;
-        switch (legacyHolds[i].channelCode) {
-            case 4: case 5: interval = 51; break;
-            case 6: interval = 68; break;
-            case 7: interval = 86; break;
-            default: interval = 51; break;
-        }
-        if (now - legacyHolds[i].lastSentMs < interval) continue;
-        if (irStartLegacy(legacyHolds[i].channelCode,
-                          legacyHolds[i].orange, legacyHolds[i].yellow)) {
-            legacyHolds[i].lastSentMs = now;
-            }
     }
 }
 
@@ -353,12 +292,10 @@ static uint8_t isValidLegacyNibble(uint8_t value) {
 
 // ============================================================
 static void doResetState(void) {
-    ifaceSetOutputs(0);
+    ifaceClearAllOutputs();
+    ifaceResetCount(6);
+    ifaceResetCount(7);
     irAbortAll();
-    for (uint8_t i = 0; i < 4; i++) {
-        pfHolds[i].active = 0;
-        legacyHolds[i].active = 0;
-    }
     pfToggle[0] = pfToggle[1] = pfToggle[2] = pfToggle[3] = 0;
 }
 
@@ -369,7 +306,7 @@ static void doResetState(void) {
 static void enterBootloader(void) {
     // Halt active peripherals before tearing down USB and jumping to ROM.
     irAbortAll();
-    ifaceSetOutputs(0);
+    ifaceClearAllOutputs();
     USB_INT_EN = 0;
     USB_CTRL = 0;
     UDEV_CTRL = 0;       // detach from bus

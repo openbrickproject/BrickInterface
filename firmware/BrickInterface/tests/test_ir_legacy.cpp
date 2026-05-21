@@ -1,7 +1,7 @@
 // Layer 2 — Legacy IR phase generator tests.
 #include "test_harness.h"
 #include "../ir_engine.h"
-#include "../ir_engine.cpp"
+#include "../ir_engine.c"
 
 struct Phase { uint8_t carrier; uint16_t duration; };
 
@@ -24,11 +24,10 @@ static int play_legacy(uint8_t channelCode, uint8_t orange, uint8_t yellow,
     int n = 0;
     while (n < max) {
         uint8_t c; uint16_t d;
-        if (!legacyNextPhase(&c, &d)) { out[n++] = (Phase){c, d}; break; }
+        if (!legacyNextPhase(&c, &d)) break;
         out[n].carrier = c;
         out[n].duration = d;
         n++;
-        if (legacyIsDone()) break;
     }
     return n;
 }

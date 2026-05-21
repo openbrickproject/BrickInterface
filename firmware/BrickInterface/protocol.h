@@ -15,20 +15,13 @@
 #define CMD_ENTER_BOOTLOADER    0x05
 
 #define CMD_IFACE_SET_OUTPUTS   0x10
-#define CMD_IFACE_GET_STATE     0x11
-#define CMD_IFACE_SET_OUT_MASK  0x12
-#define CMD_IFACE_SET_PWM       0x13
-#define CMD_IFACE_SET_PWM_ALL   0x14
+#define CMD_IFACE_GET_INPUTS    0x11
+#define CMD_IFACE_GET_COUNTS    0x12
+#define CMD_IFACE_RESET_COUNT   0x13
 
 #define CMD_PF_SEND             0x20
-#define CMD_PF_START_HOLD       0x21
-#define CMD_PF_STOP_HOLD        0x22
-#define CMD_PF_STOP_ALL         0x23
 
 #define CMD_LEGACY_SEND         0x30
-#define CMD_LEGACY_START_HOLD   0x31
-#define CMD_LEGACY_STOP_HOLD    0x32
-#define CMD_LEGACY_STOP_ALL     0x33
 
 #define CMD_IR_ABORT_ALL        0x40
 
@@ -41,7 +34,8 @@
 #define REPLY_CAPABILITIES      0x83
 #define REPLY_OK                0x84
 
-#define REPLY_IFACE_STATE       0x90
+#define REPLY_IFACE_INPUTS      0x90
+#define REPLY_IFACE_COUNTS      0x91
 
 #define REPLY_IR_ACCEPTED       0xA0
 #define REPLY_IR_DONE           0xA1
@@ -75,7 +69,7 @@
 #define PROTO_VERSION_MAJOR     1
 #define PROTO_VERSION_MINOR     0
 #define FW_VERSION_MAJOR        0
-#define FW_VERSION_MINOR        2
+#define FW_VERSION_MINOR        3
 
 // --- PF modes ---
 #define PF_MODE_COMBO_DIRECT    0x00

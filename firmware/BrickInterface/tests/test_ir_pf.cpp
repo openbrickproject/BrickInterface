@@ -2,7 +2,7 @@
 // Includes ir_engine.cpp directly to access static helpers and phase generators.
 #include "test_harness.h"
 #include "../ir_engine.h"
-#include "../ir_engine.cpp"
+#include "../ir_engine.c"
 
 // ============================================================================
 // Layer 1: pure-math primitives

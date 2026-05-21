@@ -45,17 +45,26 @@ uint8_t digitalRead(uint8_t pin) { return test_pin_input[pin]; }
 
 void delay(uint32_t /*ms*/) {}
 
-unsigned long millis(void) { return 0; }
+// Test-controllable fake clock. Set `test_now_ms` to whatever you want
+// `millis()` to return — used by pulse-width tests to advance time
+// deterministically across edge events.
+unsigned long test_now_ms = 0;
+unsigned long millis(void) { return test_now_ms; }
 
-// --- Stub Serial ---
+// --- Stub USB CDC ---
+// Tests inspect Serial.tx_buf / Serial.tx_len after sending a frame.
 TestSerial Serial;
 
-void TestSerial::write(const uint8_t *buf, uint8_t len) {
-    for (uint8_t i = 0; i < len && tx_len < sizeof(tx_buf); i++)
-        tx_buf[tx_len++] = buf[i];
+uint8_t USBSerial_print_n(const uint8_t *buf, int len) {
+    for (int i = 0; i < len && Serial.tx_len < sizeof(Serial.tx_buf); i++)
+        Serial.tx_buf[Serial.tx_len++] = buf[i];
+    return (uint8_t)len;
 }
 
-void TestSerial::write(uint8_t b) { write(&b, 1); }
+uint8_t USBSerial_write(uint8_t c) {
+    if (Serial.tx_len < sizeof(Serial.tx_buf)) Serial.tx_buf[Serial.tx_len++] = c;
+    return 1;
+}
 
 // --- CH552 SFR stubs (writable globals) ---
 volatile uint8_t PIN_FUNC = 0;

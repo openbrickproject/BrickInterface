@@ -1,7 +1,7 @@
 // Layer 1 — packet parser/builder unit tests.
 #include "test_harness.h"
 #include "../packet.h"
-#include "../packet.cpp"  // pull in implementation directly
+#include "../packet.c"  // pull in implementation directly
 
 static void feed(PacketParser *p, const uint8_t *bytes, size_t n) {
     for (size_t i = 0; i < n; i++) parserConsume(p, bytes[i]);

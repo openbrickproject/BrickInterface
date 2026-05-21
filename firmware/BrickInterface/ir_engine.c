@@ -18,22 +18,23 @@
 static uint8_t carrierDutyVal = 0;
 
 static void carrierSetFrequency(uint32_t hz, uint8_t dutyPct) {
-    // Find prescaler + cycle that fits in 8-bit cycle register
-    // Fsys = 24 MHz (ch55xduino default when USB active)
-    // PWM freq = 24000000 / prescaler / cycle
-    uint8_t prescaler, cycle;
+    // TODO: the CH552 PWM module has a fixed 256-count cycle (no PWM_CYCLE
+    // register), so it cannot generate a clean 38/76 kHz carrier. Closest
+    // achievable values from 24 MHz Fsys are 46.875 kHz (PWM_CK_SE=2) and
+    // 93.75 kHz (PWM_CK_SE=1) — both well outside IR receiver bandpass.
+    // Real fix: bit-bang the carrier from a Timer 2 ISR. Until then, IR
+    // transmission will not drive a real receiver.
+    uint8_t prescaler;
+    uint8_t cycle = 255;  // fixed: CH552 PWM cycle is 256 counts
 
     if (hz == 38000) {
-        prescaler = 3;  // 24MHz/3 = 8MHz PWM clock
-        cycle = 211;    // 8MHz/211 = 37,915 Hz (err -0.22%)
+        prescaler = 2;  // 24MHz/2/256 = 46,875 Hz (NOT in PF receiver band)
     } else if (hz == 76000) {
-        prescaler = 2;  // 24MHz/2 = 12MHz PWM clock
-        cycle = 158;    // 12MHz/158 = 75,949 Hz (err -0.07%)
+        prescaler = 1;  // 24MHz/1/256 = 93,750 Hz (NOT in Legacy receiver band)
     } else {
-        // Generic calculation
         uint32_t total = 24000000UL / hz;
-        prescaler = (total / 255) + 1;
-        cycle = total / prescaler;
+        prescaler = (total / 256) + 1;
+        if (prescaler == 0) prescaler = 1;
     }
 
     carrierDutyVal = ((uint16_t)cycle * dutyPct) / 100;
@@ -42,7 +43,6 @@ static void carrierSetFrequency(uint32_t hz, uint8_t dutyPct) {
     PIN_FUNC &= ~bPWM2_PIN_X;
 
     PWM_CK_SE = prescaler;
-    PWM_CYCLE = cycle;
     PWM_DATA2 = 0;  // Start with carrier off
 }
 
@@ -173,6 +173,9 @@ static uint8_t pfNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
 static uint8_t legacyNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
     LegacyState *s = (LegacyState *)&state.legacy;
 
+    // All repeats finished — the prior call already emitted the last stop bit.
+    if (s->repeat >= LEGACY_REPEAT_COUNT) return 0;
+
     *duration_us = LEGACY_BIT_US;
 
     // Handle inter-message gap
@@ -224,12 +227,6 @@ static uint8_t legacyNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
     return 1;
 }
 
-// Check if legacy is done (called after nextPhase returns 1)
-static uint8_t legacyIsDone(void) {
-    LegacyState *s = (LegacyState *)&state.legacy;
-    return (s->repeat >= LEGACY_REPEAT_COUNT && s->bitIdx == 0 && !s->inGap);
-}
-
 // --- RCX nextPhase ---
 static uint8_t rcxNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
     RCXState *s = (RCXState *)&state.rcx;
@@ -267,14 +264,8 @@ static uint8_t irGetNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
     switch (state.active) {
     case IR_ACTIVE_PF:
         return pfNextPhase(carrier_on, duration_us);
-    case IR_ACTIVE_LEGACY: {
-        uint8_t r = legacyNextPhase(carrier_on, duration_us);
-        if (r && legacyIsDone()) {
-            // This was the last phase
-            state.active = IR_ACTIVE_NONE;
-        }
-        return r;
-    }
+    case IR_ACTIVE_LEGACY:
+        return legacyNextPhase(carrier_on, duration_us);
     case IR_ACTIVE_RCX:
         return rcxNextPhase(carrier_on, duration_us);
     default:
@@ -286,12 +277,7 @@ static uint8_t irGetNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
 // Timer0 ISR — envelope timing
 // ============================================================
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-void Timer0_ISR(void) __attribute__((interrupt("1")));
-void Timer0_ISR(void) {
+void Timer0_ISR(void) __interrupt(1) {
     TR0 = 0;  // Stop timer
 
     // Handle long gaps (counted down in chunks)
@@ -329,10 +315,6 @@ void Timer0_ISR(void) {
     }
     envelopeStart(duration_us);
 }
-
-#ifdef __cplusplus
-}
-#endif
 
 // ============================================================
 // Start transmission from state

@@ -1,7 +1,7 @@
 // Layer 1+2 — RCX IR framing + phase generator tests.
 #include "test_harness.h"
 #include "../ir_engine.h"
-#include "../ir_engine.cpp"
+#include "../ir_engine.c"
 
 TEST(rcx_framing_single_byte) {
     // irStartRCX builds the framed packet: 0x55 0xFF 0x00 D ~D C ~C

@@ -71,7 +71,7 @@ void sendReply(uint8_t seq, uint8_t cmd,
                const uint8_t *payload, uint8_t payloadLen) {
     uint8_t buf[1 + 1 + 1 + 1 + PROTO_MAX_PAYLOAD + 1];
     uint8_t len = buildPacket(buf, seq, cmd, payload, payloadLen);
-    Serial.write(buf, len);
+    USBSerial_print_n(buf, len);
     actLedPulse();
 }
 

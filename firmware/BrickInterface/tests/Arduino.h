@@ -38,18 +38,23 @@ extern uint8_t test_pin_state[256];
 extern uint8_t test_pin_input[256];   // host-set readback for digitalRead
 void test_reset_pin_state(void);
 
-// Stub Serial — captures bytes written by sendReply for inspection
+// Test-controllable fake clock for `millis()` — pulse-width tests advance
+// it between simulated edges.
+extern unsigned long test_now_ms;
+
+// Stub USB CDC — captures bytes written by sendReply for inspection.
+// Mirrors ch55xduino's USBSerial_* API.
 struct TestSerial {
     uint8_t tx_buf[256];
     uint16_t tx_len;
-    void begin(uint32_t) {}
-    int available(void) { return 0; }
-    int read(void) { return -1; }
-    void write(const uint8_t *buf, uint8_t len);
-    void write(uint8_t b);
-    void flush(void) {}
 };
-extern TestSerial Serial;
+extern TestSerial Serial;  // shared buffer for tests to inspect
+
+inline uint8_t USBSerial_available(void) { return 0; }
+inline char USBSerial_read(void) { return 0; }
+inline void USBSerial_flush(void) {}
+uint8_t USBSerial_print_n(const uint8_t *buf, int len);
+uint8_t USBSerial_write(uint8_t c);
 
 // ===========================================================================
 // CH552 SFR + bit stubs — match ch5xx.h symbol names so firmware compiles
