@@ -133,68 +133,27 @@ void setup() {
 
 // ============================================================
 void loop() {
-    // INTEGRATION TEST: IFA + PF IR cycling, 8 states × 2s each.
-    //
-    // PF data byte for Single Output PWM mode (channel 1, escape=0, addr=0):
-    //   bit 4   = output select (0 = A/red, 1 = B/blue)
-    //   bits 3-0 = PWM step (0 = float, 7 = fwd7, 9 = rev7)
-    //
-    //   Blue fwd  = 0x17    Blue rev  = 0x19    Blue float = 0x10
-    //   Red  fwd  = 0x07    Red  rev  = 0x09    Red  float = 0x00
-    static uint8_t step = 0;
-    static uint8_t duties[6] = {0, 0, 0, 0, 0, 0};
-
-    for (uint8_t i = 0; i < 6; i++) duties[i] = 0;
-    uint8_t pf_data;
-    uint8_t act_led = LOW;
-
-    switch (step) {
-        case 0: duties[0] = 255; pf_data = 0x17; act_led = HIGH; break;  // OUT0 + blue fwd
-        case 1:                  pf_data = 0x10;                 break;  // off  + blue float
-        case 2: duties[1] = 255; pf_data = 0x19; act_led = HIGH; break;  // OUT1 + blue rev
-        case 3:                  pf_data = 0x10;                 break;  // off  + blue float
-        case 4: duties[2] = 255; pf_data = 0x07; act_led = HIGH; break;  // OUT2 + red  fwd
-        case 5:                  pf_data = 0x00;                 break;  // off  + red  float
-        case 6: duties[3] = 255; pf_data = 0x09; act_led = HIGH; break;  // OUT3 + red  rev
-        default:                 pf_data = 0x00;                 break;  // off  + red  float
+    // Parse incoming packets
+    while (USBSerial_available()) {
+        uint8_t b = USBSerial_read();
+        actLedPulse();
+        parserConsume(&parser, b);
+        if (parser.ready) {
+            parser.ready = 0;
+            handlePacket(&parser.pkt);
+        }
     }
 
-    digitalWrite(ACT_LED_PIN, act_led);
-    ifaceSetOutputs(duties, 0x3F);
+    // IR completion events
+    uint8_t token, engine;
+    if (irGetCompletion(&token, &engine)) {
+        uint8_t payload[2] = { token, engine };
+        sendReply(0x00, REPLY_IR_DONE, payload, 2);
+    }
 
-    // Queue the PF command and kick the engine. The Timer 2 ISR drives the
-    // transmission to completion in the background (~400 ms), so the delay
-    // below doesn't block the IR engine — only this loop.
-    irStartPF(0, PF_MODE_SINGLE_PWM, pf_data, 0);
+    actLedTick();
     irPoll();
-
-    delay(2000);
-
-    // Drain any IR completion that fired during the dwell so the engine's
-    // completion slot doesn't go stale.
-    uint8_t tok, eng;
-    irGetCompletion(&tok, &eng);
-
-    step = (step + 1) & 0x7;
-
-    // // Normal dispatcher (restore by replacing the test block above):
-    // while (USBSerial_available()) {
-    //     uint8_t b = USBSerial_read();
-    //     actLedPulse();
-    //     parserConsume(&parser, b);
-    //     if (parser.ready) {
-    //         parser.ready = 0;
-    //         handlePacket(&parser.pkt);
-    //     }
-    // }
-    // uint8_t token, engine;
-    // if (irGetCompletion(&token, &engine)) {
-    //     uint8_t payload[2] = { token, engine };
-    //     sendReply(0x00, REPLY_IR_DONE, payload, 2);
-    // }
-    // actLedTick();
-    // irPoll();
-    // ifaceEdgePoll();
+    ifaceEdgePoll();
 }
 
 // ============================================================
