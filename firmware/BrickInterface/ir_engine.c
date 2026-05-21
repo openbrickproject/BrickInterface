@@ -4,98 +4,39 @@
 #include "protocol.h"
 
 // ============================================================
-// CH552T carrier control via PWM2 on P3.4
-// ============================================================
-// On the CH552, P3.4 is the default output for PWM2 (NOT PWM1).
-// PWM1 default = P1.5; PWM1 alternate (bPWM1_PIN_X) = P3.0
-// PWM2 default = P3.4; PWM2 alternate (bPWM2_PIN_X) = P3.1
-// We use PWM2 in default mode to drive P3.4 (where the IR LED is wired).
+// Streaming IR engine for CH552T — Timer 2 unified ISR architecture.
 //
-// PWM_CK_SE: clock prescaler (Fpwm = Fsys / PWM_CK_SE)
-// PWM_CYCLE: period in PWM clocks
-// PWM_DATA2: duty cycle for PWM2 output
-
-static uint8_t carrierDutyVal = 0;
-
-static void carrierSetFrequency(uint32_t hz, uint8_t dutyPct) {
-    // TODO: the CH552 PWM module has a fixed 256-count cycle (no PWM_CYCLE
-    // register), so it cannot generate a clean 38/76 kHz carrier. Closest
-    // achievable values from 24 MHz Fsys are 46.875 kHz (PWM_CK_SE=2) and
-    // 93.75 kHz (PWM_CK_SE=1) — both well outside IR receiver bandpass.
-    // Real fix: bit-bang the carrier from a Timer 2 ISR. Until then, IR
-    // transmission will not drive a real receiver.
-    uint8_t prescaler;
-    uint8_t cycle = 255;  // fixed: CH552 PWM cycle is 256 counts
-
-    if (hz == 38000) {
-        prescaler = 2;  // 24MHz/2/256 = 46,875 Hz (NOT in PF receiver band)
-    } else if (hz == 76000) {
-        prescaler = 1;  // 24MHz/1/256 = 93,750 Hz (NOT in Legacy receiver band)
-    } else {
-        uint32_t total = 24000000UL / hz;
-        prescaler = (total / 256) + 1;
-        if (prescaler == 0) prescaler = 1;
-    }
-
-    carrierDutyVal = ((uint16_t)cycle * dutyPct) / 100;
-
-    // Ensure PWM2 routes to P3.4 (default), not P3.1 (alternate)
-    PIN_FUNC &= ~bPWM2_PIN_X;
-
-    PWM_CK_SE = prescaler;
-    PWM_DATA2 = 0;  // Start with carrier off
-}
-
-static void carrierEnable(void) {
-    PWM_DATA2 = carrierDutyVal;
-    PWM_CTRL |= bPWM2_OUT_EN;
-}
-
-static void carrierDisable(void) {
-    PWM_CTRL &= ~bPWM2_OUT_EN;
-    PWM_DATA2 = 0;
-    digitalWrite(IR_LED_PIN, LOW);
-}
-
-// ============================================================
-// Envelope timing via Timer0 (16-bit mode)
-// ============================================================
-// Fsys/12 = 2 MHz tick (0.5 us per tick)
-// Max single period: 65536/2MHz = 32.768 ms
-// For longer durations, we count down in chunks.
-
-static volatile uint16_t envelopeRemaining = 0;  // remaining us for long gaps
-
-static void envelopeStart(uint16_t us) {
-    TR0 = 0;  // Stop timer
-
-    if (us > 32000) {
-        envelopeRemaining = us - 32000;
-        us = 32000;
-    } else {
-        envelopeRemaining = 0;
-    }
-
-    uint16_t ticks = us * 2;
-    uint16_t load = 65536 - ticks;
-    TH0 = load >> 8;
-    TL0 = load & 0xFF;
-    TF0 = 0;   // Clear overflow flag
-    TR0 = 1;   // Start timer
-}
-
-static void envelopeStop(void) {
-    TR0 = 0;
-    ET0 = 0;
-}
-
-// ============================================================
-// State
+// The Timer 2 ISR (defined in BrickInterface.ino) runs at 153.85 kHz and:
+//   - toggles P3.4 every ISR (carrier mode 2 = 76 kHz output, for Legacy)
+//   - toggles P3.4 every 2 ISRs (carrier mode 1 = 38 kHz output, for PF/RCX)
+//   - leaves P3.4 low (carrier mode 0 = off, for spaces and idle)
+// and counts down `envelopeTicks` every ISR. When it hits 0, the ISR calls
+// irNextPhase() to load the next mark/space phase. When the protocol-
+// specific nextPhase returns 0, the ISR signals completion via the
+// `completionPending` flag and clears state.active.
+//
+// All envelope durations are expressed in Timer 2 ticks (6.5 us each), not
+// microseconds. This avoids any conversion math inside the ISR.
+//
+// We do NOT touch the CH552 PWM module or Timer 0 anymore. The old design
+// tried to drive the carrier via PWM2 (couldn't reach 38 kHz cleanly) and
+// time the envelope with Timer 0 (collides with ch55xduino's millis/delay).
+// Both broken paths are gone.
 // ============================================================
 
+// ============================================================
+// Shared state with the Timer 2 ISR
+// ============================================================
+volatile __data uint8_t  carrierMode      = 0;
+volatile __data uint8_t  carrierPrescale  = 0;
+volatile __data uint16_t envelopeTicks    = 0;
+volatile __data uint8_t  completionPending = 0;
+
+// ============================================================
+// Engine state
+// ============================================================
 static volatile IRStreamState state;
 static volatile IRPending pending;
-static volatile uint8_t completionPending = 0;
 static volatile uint8_t completionToken = 0;
 static volatile uint8_t completionEngine = 0;
 static uint8_t tokenCounter = 1;
@@ -103,7 +44,7 @@ static uint8_t tokenCounter = 1;
 uint8_t pfToggle[4] = {0, 0, 0, 0};
 
 // ============================================================
-// Protocol nextPhase functions
+// Helpers
 // ============================================================
 
 static uint8_t oddParity(uint8_t b) {
@@ -112,15 +53,20 @@ static uint8_t oddParity(uint8_t b) {
     return p;
 }
 
-// --- PF nextPhase ---
-// Returns 1 and fills carrier_on/duration_us, or 0 when done.
-static uint8_t pfNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
+// ============================================================
+// Protocol nextPhase functions — return duration in TICKS.
+// `carrier_on` is 0 (space) or 1 (mark). The caller (irNextPhase) maps
+// carrier_on=1 to a carrierMode value based on the active protocol's
+// carrier frequency.
+// ============================================================
+
+static uint8_t pfNextPhase(uint8_t *carrier_on, uint16_t *ticks) {
     PFState *s = (PFState *)&state.pf;
 
     if (s->phase == 0) {
         // Mark
         *carrier_on = 1;
-        *duration_us = PF_MARK_US;
+        *ticks = PF_MARK_TICKS;
         s->phase = 1;
         return 1;
     }
@@ -131,7 +77,7 @@ static uint8_t pfNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
     if (s->pos == 0) {
         // Start space
         *carrier_on = 0;
-        *duration_us = PF_START_SPACE_US;
+        *ticks = PF_START_SPACE_TICKS;
         s->pos = 1;
         return 1;
     }
@@ -143,7 +89,7 @@ static uint8_t pfNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
         uint8_t bitInNib = 3 - (bitIdx % 4);
         uint8_t bit = (s->nibbles[nibIdx] >> bitInNib) & 1;
         *carrier_on = 0;
-        *duration_us = bit ? PF_ONE_SPACE_US : PF_ZERO_SPACE_US;
+        *ticks = bit ? PF_ONE_SPACE_TICKS : PF_ZERO_SPACE_TICKS;
         s->pos++;
         return 1;
     }
@@ -157,42 +103,39 @@ static uint8_t pfNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
     // Inter-message gap
     uint16_t gap;
     switch (s->channel) {
-        case 0: gap = PF_GAP_CH0_US; break;
-        case 1: gap = PF_GAP_CH1_US; break;
-        case 2: gap = PF_GAP_CH2_US; break;
-        case 3: gap = PF_GAP_CH3_US; break;
-        default: gap = PF_GAP_CH0_US; break;
+        case 0: gap = PF_GAP_CH0_TICKS; break;
+        case 1: gap = PF_GAP_CH1_TICKS; break;
+        case 2: gap = PF_GAP_CH2_TICKS; break;
+        case 3: gap = PF_GAP_CH3_TICKS; break;
+        default: gap = PF_GAP_CH0_TICKS; break;
     }
     *carrier_on = 0;
-    *duration_us = gap;
+    *ticks = gap;
     s->pos = 0;  // Reset for next repeat
     return 1;
 }
 
-// --- Legacy nextPhase ---
-static uint8_t legacyNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
+static uint8_t legacyNextPhase(uint8_t *carrier_on, uint16_t *ticks) {
     LegacyState *s = (LegacyState *)&state.legacy;
 
-    // All repeats finished — the prior call already emitted the last stop bit.
     if (s->repeat >= LEGACY_REPEAT_COUNT) return 0;
 
-    *duration_us = LEGACY_BIT_US;
+    *ticks = LEGACY_BIT_TICKS;
 
-    // Handle inter-message gap
     if (s->inGap) {
         s->inGap = 0;
         *carrier_on = 0;
-        uint16_t gap_ms;
+        // Inter-message gap (channel-dependent), minus the ~22-bit message
+        // window so total spacing matches the original spec.
+        uint16_t gap_ticks;
         switch (s->channelCode) {
-            case 4: case 5: gap_ms = 51; break;
-            case 6: gap_ms = 68; break;
-            case 7: gap_ms = 86; break;
-            default: gap_ms = 51; break;
+            case 4: case 5: gap_ticks = 7846; break;  // 51 ms
+            case 6:         gap_ticks = 10462; break; // 68 ms
+            case 7:         gap_ticks = 13231; break; // 86 ms
+            default:        gap_ticks = 7846; break;
         }
-        // Gap minus message duration (~22 bits * 208us = ~4.6ms)
-        uint16_t msg_us = 22 * LEGACY_BIT_US;
-        uint16_t gap_us = gap_ms * 1000U;
-        *duration_us = (gap_us > msg_us) ? (gap_us - msg_us) : 1000;
+        uint16_t msg_ticks = 22 * LEGACY_BIT_TICKS;
+        *ticks = (gap_ticks > msg_ticks) ? (gap_ticks - msg_ticks) : 154;  // 154 ~= 1 ms
         return 1;
     }
 
@@ -202,7 +145,7 @@ static uint8_t legacyNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
         *carrier_on = 1;  // Start bit: mark
     } else if (s->bitIdx <= 8) {
         uint8_t bit = (byte >> (s->bitIdx - 1)) & 1;
-        *carrier_on = !bit;  // 0=carrier on, 1=carrier off
+        *carrier_on = !bit;
     } else if (s->bitIdx == 9) {
         uint8_t par = oddParity(byte);
         *carrier_on = !par;
@@ -215,11 +158,10 @@ static uint8_t legacyNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
         s->bitIdx = 0;
         s->byteIdx++;
         if (s->byteIdx > 1) {
-            // Finished both bytes
             s->byteIdx = 0;
             s->repeat++;
             if (s->repeat >= LEGACY_REPEAT_COUNT) {
-                return 1;  // Return this last phase, will return 0 next call
+                return 1;  // emit last phase, return 0 next call
             }
             s->inGap = 1;
         }
@@ -227,13 +169,12 @@ static uint8_t legacyNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
     return 1;
 }
 
-// --- RCX nextPhase ---
-static uint8_t rcxNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
+static uint8_t rcxNextPhase(uint8_t *carrier_on, uint16_t *ticks) {
     RCXState *s = (RCXState *)&state.rcx;
 
     if (s->byteIdx >= s->byteCount) return 0;
 
-    *duration_us = RCX_BIT_US;
+    *ticks = RCX_BIT_TICKS;
     uint8_t byte = s->bytes[s->byteIdx];
 
     if (s->bitIdx == 0) {
@@ -257,91 +198,46 @@ static uint8_t rcxNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
 }
 
 // ============================================================
-// Dispatch to active protocol's nextPhase
+// irNextPhase — called from the Timer 2 ISR when envelopeTicks hits 0.
+//
+// Returns 1 with carrier_mode (0/1/2) and ticks filled, or 0 when the
+// active transmission is complete (also clears state.active so the engine
+// is ready for the next request).
 // ============================================================
+uint8_t irNextPhase(uint8_t *carrier_mode, uint16_t *ticks) {
+    uint8_t carrier_on = 0;
+    uint8_t res = 0;
 
-static uint8_t irGetNextPhase(uint8_t *carrier_on, uint16_t *duration_us) {
     switch (state.active) {
     case IR_ACTIVE_PF:
-        return pfNextPhase(carrier_on, duration_us);
+        res = pfNextPhase(&carrier_on, ticks);
+        break;
     case IR_ACTIVE_LEGACY:
-        return legacyNextPhase(carrier_on, duration_us);
+        res = legacyNextPhase(&carrier_on, ticks);
+        break;
     case IR_ACTIVE_RCX:
-        return rcxNextPhase(carrier_on, duration_us);
+        res = rcxNextPhase(&carrier_on, ticks);
+        break;
     default:
         return 0;
     }
-}
 
-// ============================================================
-// Timer0 ISR — envelope timing
-// ============================================================
-
-void Timer0_ISR(void) __interrupt(1) {
-    TR0 = 0;  // Stop timer
-
-    // Handle long gaps (counted down in chunks)
-    if (envelopeRemaining > 0) {
-        uint16_t chunk = envelopeRemaining;
-        if (chunk > 32000) chunk = 32000;
-        envelopeRemaining -= chunk;
-        uint16_t load = 65536 - (chunk * 2);
-        TH0 = load >> 8;
-        TL0 = load & 0xFF;
-        TF0 = 0;
-        TR0 = 1;
-        return;
-    }
-
-    // Get next phase
-    uint8_t carrier_on;
-    uint16_t duration_us;
-
-    if (!irGetNextPhase(&carrier_on, &duration_us)) {
-        // Transmission complete
-        carrierDisable();
-        envelopeStop();
-        state.active = IR_ACTIVE_NONE;
+    if (!res) {
+        // Transmission complete — flag the main loop and release the engine.
         completionToken = state.token;
         completionEngine = state.engine;
-        completionPending = 1;
-        return;
-    }
-
-    if (carrier_on) {
-        carrierEnable();
-    } else {
-        carrierDisable();
-    }
-    envelopeStart(duration_us);
-}
-
-// ============================================================
-// Start transmission from state
-// ============================================================
-
-static void beginTransmission(void) {
-    carrierSetFrequency(state.carrier_hz, state.duty_pct);
-
-    // Get first phase
-    uint8_t carrier_on;
-    uint16_t duration_us;
-    if (!irGetNextPhase(&carrier_on, &duration_us)) {
         state.active = IR_ACTIVE_NONE;
-        return;
+        return 0;
     }
 
+    // Map carrier_on to carrierMode based on the active protocol's frequency.
+    // PF and RCX use 38 kHz (mode 1). Legacy uses 76 kHz (mode 2).
     if (carrier_on) {
-        carrierEnable();
+        *carrier_mode = (state.active == IR_ACTIVE_LEGACY) ? 2 : 1;
     } else {
-        carrierDisable();
+        *carrier_mode = 0;
     }
-
-    // Configure Timer0: mode 1 (16-bit), Fsys/12
-    TMOD = (TMOD & 0xF0) | 0x01;
-    ET0 = 1;  // Enable Timer0 interrupt
-    EA = 1;   // Global interrupt enable
-    envelopeStart(duration_us);
+    return 1;
 }
 
 // ============================================================
@@ -394,18 +290,17 @@ void irInit(void) {
     pinMode(IR_LED_PIN, OUTPUT);
     digitalWrite(IR_LED_PIN, LOW);
 
-    // Initialize PWM module — we use PWM2 (P3.4 default routing)
-    PWM_DATA2 = 0;
+    // Make sure the PWM2 module isn't driving P3.4 (legacy paths in the core
+    // may leave it enabled). We drive the pin directly from the Timer 2 ISR.
     PWM_CTRL &= ~bPWM2_OUT_EN;
-    PIN_FUNC &= ~bPWM2_PIN_X;  // Ensure PWM2 routes to P3.4, not P3.1
-
-    // Timer0 stopped
-    TR0 = 0;
-    ET0 = 0;
+    PWM_DATA2 = 0;
 
     state.active = IR_ACTIVE_NONE;
     pending.valid = 0;
     completionPending = 0;
+    carrierMode = 0;
+    carrierPrescale = 0;
+    envelopeTicks = 0;
     tokenCounter = 1;
 }
 
@@ -420,13 +315,18 @@ uint8_t irIsBusy(void) {
 }
 
 void irAbortAll(void) {
-    EA = 0;
-    TR0 = 0;
-    ET0 = 0;
-    carrierDisable();
+    // Stop any in-flight transmission cleanly. We mask Timer 2's interrupt
+    // briefly so the ISR can't fire mid-tear-down and observe inconsistent
+    // state.
+    ET2 = 0;
+    envelopeTicks = 0;
+    carrierMode = 0;
+    carrierPrescale = 0;
+    P3_4 = 0;
     state.active = IR_ACTIVE_NONE;
     pending.valid = 0;
-    EA = 1;
+    completionPending = 0;
+    ET2 = 1;
 }
 
 uint8_t irGetCompletion(uint8_t *token, uint8_t *engine) {
@@ -438,17 +338,17 @@ uint8_t irGetCompletion(uint8_t *token, uint8_t *engine) {
 }
 
 void irPoll(void) {
-    if (state.active != IR_ACTIVE_NONE || !pending.valid) return;
+    // Nothing to do if a transmission is in flight or no request queued.
+    if (state.active != IR_ACTIVE_NONE) return;
+    if (!pending.valid) return;
 
-    // Activate pending request
+    // Move the pending request into active state.
     state.token = pending.token;
     state.engine = pending.engine;
 
     switch (pending.engineType) {
     case IR_ACTIVE_PF:
         state.active = IR_ACTIVE_PF;
-        state.carrier_hz = 38000;
-        state.duty_pct = 33;
         pfBuildNibbles((uint8_t *)state.pf.nibbles, pending.pf.channel, pending.pf.mode,
                        pending.pf.data, pending.pf.flags);
         state.pf.channel = pending.pf.channel;
@@ -459,8 +359,6 @@ void irPoll(void) {
 
     case IR_ACTIVE_LEGACY:
         state.active = IR_ACTIVE_LEGACY;
-        state.carrier_hz = 76000;
-        state.duty_pct = 25;
         {
             uint8_t ch = pending.legacy.channelCode;
             uint8_t or_ = pending.legacy.orange;
@@ -478,11 +376,6 @@ void irPoll(void) {
 
     case IR_ACTIVE_RCX:
         state.active = IR_ACTIVE_RCX;
-        // RCX is always 38 kHz. The "long range" flag on real RCX hardware
-        // changes IR LED drive power, NOT carrier frequency. carrierMode is
-        // accepted for API compat but ignored.
-        state.carrier_hz = 38000;
-        state.duty_pct = 25;
         for (uint8_t i = 0; i < pending.rcx.count; i++) {
             state.rcx.bytes[i] = pending.rcx.bytes[i];
         }
@@ -497,7 +390,13 @@ void irPoll(void) {
     }
 
     pending.valid = 0;
-    beginTransmission();
+
+    // Prime the envelope state machine. envelopeTicks=1 means the ISR
+    // will load the first phase on its very next tick. Set this last so
+    // the ISR doesn't try to advance before state is fully initialized.
+    carrierMode = 0;
+    carrierPrescale = 0;
+    envelopeTicks = 1;
 }
 
 // --- Enqueue functions ---
@@ -534,7 +433,8 @@ uint8_t irStartLegacy(uint8_t channelCode, uint8_t orange, uint8_t yellow) {
     return token;
 }
 
-uint8_t irStartRCX(const uint8_t *data, uint8_t dataLen, uint8_t carrierMode) {
+uint8_t irStartRCX(const uint8_t *data, uint8_t dataLen, uint8_t carrierMode_unused) {
+    (void)carrierMode_unused;
     if (dataLen == 0 || dataLen > 16) return 0;
     if (state.active != IR_ACTIVE_NONE || pending.valid) return 0;
 
@@ -560,12 +460,12 @@ uint8_t irStartRCX(const uint8_t *data, uint8_t dataLen, uint8_t carrierMode) {
     pending.engineType = IR_ACTIVE_RCX;
     for (uint8_t i = 0; i < pos; i++) pending.rcx.bytes[i] = framed[i];
     pending.rcx.count = pos;
-    pending.rcx.carrierMode = carrierMode;
     pending.valid = 1;
     return token;
 }
 
-uint8_t irStartRCXRaw(const uint8_t *rawBytes, uint8_t rawLen, uint8_t carrierMode) {
+uint8_t irStartRCXRaw(const uint8_t *rawBytes, uint8_t rawLen, uint8_t carrierMode_unused) {
+    (void)carrierMode_unused;
     if (rawLen == 0 || rawLen > RCX_MAX_FRAMED_BYTES) return 0;
     if (state.active != IR_ACTIVE_NONE || pending.valid) return 0;
 
@@ -575,7 +475,6 @@ uint8_t irStartRCXRaw(const uint8_t *rawBytes, uint8_t rawLen, uint8_t carrierMo
     pending.engineType = IR_ACTIVE_RCX;
     for (uint8_t i = 0; i < rawLen; i++) pending.rcx.bytes[i] = rawBytes[i];
     pending.rcx.count = rawLen;
-    pending.rcx.carrierMode = carrierMode;
     pending.valid = 1;
     return token;
 }

@@ -25,18 +25,25 @@ static __data uint8_t inputPrev[2]    = {1, 1};
 // ============================================================
 static void pwmTimerInit(void) {
     // Timer 2 in 16-bit auto-reload mode, clock = Fsys/12 = 2 MHz.
-    // Reload 65536 - 78 = 65458 -> overflow every 78 ticks at 2 MHz
-    // = ~25.6 kHz interrupt rate -> ~100 Hz PWM at 256 levels.
+    // Reload 65536 - 13 = 65523 -> overflow every 13 timer ticks
+    // = 6.5 us per ISR -> 153.85 kHz ISR rate.
     //
-    // We use Timer 2 (not Timer 1) because ch55xduino's core declares a
-    // weak Timer2Interrupt() in main.c with the vector pre-installed, so
-    // a user-code override from the sketch (the .ino) gets picked up by
-    // the linker. There is no equivalent hook for Timer 1.
+    // The unified Timer 2 ISR (in BrickInterface.ino) handles three jobs at
+    // this rate:
+    //   - IR carrier toggle (every 2 ISRs for 38 kHz, every ISR for 76 kHz)
+    //   - IR envelope phase countdown
+    //   - IFA software PWM tick (every 6th ISR -> 25.6 kHz tick rate
+    //     -> 100 Hz PWM frequency at 256 levels, same as the original design)
+    //
+    // We use Timer 2 because ch55xduino's core declares a weak Timer2Interrupt
+    // with the vector pre-installed; user-code overrides get picked up by the
+    // linker. There is no equivalent hook for Timer 0 (used by millis/delay)
+    // or Timer 1 (no weak declaration in the core).
     T2MOD &= ~bT2_CLK;             // Timer 2 clock = Fsys/12
-    RCAP2H = 0xFF;                 // reload high byte (65458 >> 8)
-    RCAP2L = 0xB2;                 // reload low byte  (65458 & 0xFF)
-    TH2 = 0xFF;                    // seed counter
-    TL2 = 0xB2;
+    RCAP2H = 0xFF;                 // reload = 65523 = 0xFFF3
+    RCAP2L = 0xF3;
+    TH2 = 0xFF;
+    TL2 = 0xF3;
     T2CON = 0x04;                  // auto-reload, internal clock, TR2 = 1 (run)
     ET2 = 1;                       // enable Timer 2 interrupt
     EA = 1;                        // global interrupt enable

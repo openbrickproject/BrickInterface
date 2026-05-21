@@ -48,24 +48,71 @@ static uint8_t isValidPFMode(uint8_t mode);
 static uint8_t isValidLegacyNibble(uint8_t value);
 
 // ============================================================
-// Timer 2 ISR — software PWM driver for the 6 Interface A outputs.
+// Unified Timer 2 ISR — 153.85 kHz.
 //
-// We use Timer 2 because ch55xduino's main.c declares the Timer 2 vector
-// (pointing to a weak Timer2Interrupt symbol). Defining Timer2Interrupt
-// in the sketch overrides the core's empty weak version at link time.
-// SDCC only installs interrupt vectors in the translation unit containing
-// main(), and main() lives in ch55xduino/cores/.../main.c — not in our .ino —
-// so we cannot install a Timer 1 vector from user code.
-void Timer2Interrupt(void) __interrupt {
-    TF2 = 0;  // clear Timer 2 overflow flag (not auto-cleared)
+// Three responsibilities, all run from the same vector:
+//   (1) IR carrier toggle on P3.4
+//       - carrierMode=2: toggle every ISR → 76.92 kHz output (Legacy)
+//       - carrierMode=1: toggle every 2 ISRs → 38.46 kHz output (PF, RCX)
+//       - carrierMode=0: pin held low (spaces, idle)
+//   (2) IR envelope state machine
+//       - decrements envelopeTicks; when it hits 0, calls irNextPhase()
+//         to load the next mark/space duration, or signals completion
+//   (3) Interface A software PWM tick
+//       - every 6th ISR → 25.6 kHz tick rate → 100 Hz PWM at 256 levels
+//
+// SDCC installs the Timer 2 vector via the weak Timer2Interrupt() in
+// ch55xduino's core; our definition here overrides it at link time.
+// (Timer 0 and Timer 1 have no equivalent hook from user code.)
+// ============================================================
+#define IFA_PRESCALE_MAX 6
 
-    uint8_t c = pwmCounter++;
-    P1_4 = (c < pwmDuty[0]) ? 1 : 0;  // OUT0
-    P1_5 = (c < pwmDuty[1]) ? 1 : 0;  // OUT1
-    P1_6 = (c < pwmDuty[2]) ? 1 : 0;  // OUT2
-    P1_7 = (c < pwmDuty[3]) ? 1 : 0;  // OUT3
-    P3_1 = (c < pwmDuty[4]) ? 1 : 0;  // OUT4
-    P3_0 = (c < pwmDuty[5]) ? 1 : 0;  // OUT5
+static volatile __data uint8_t ifaPrescale = 0;
+
+void Timer2Interrupt(void) __interrupt {
+    TF2 = 0;  // Timer 2 overflow flag is not auto-cleared
+
+    // (1) Carrier toggle
+    if (carrierMode == 2) {
+        P3_4 = !P3_4;
+    } else if (carrierMode == 1) {
+        if (++carrierPrescale >= 2) {
+            carrierPrescale = 0;
+            P3_4 = !P3_4;
+        }
+    }
+
+    // (2) Envelope phase progression
+    if (envelopeTicks > 0) {
+        if (--envelopeTicks == 0) {
+            uint8_t cm;
+            uint16_t ticks;
+            if (irNextPhase(&cm, &ticks)) {
+                carrierMode = cm;
+                carrierPrescale = 0;
+                if (cm == 0) P3_4 = 0;
+                envelopeTicks = ticks;
+            } else {
+                // Transmission complete — irNextPhase already cleared
+                // state.active and set the completion token/engine fields.
+                carrierMode = 0;
+                P3_4 = 0;
+                completionPending = 1;
+            }
+        }
+    }
+
+    // (3) Interface A PWM (every 6th ISR ≈ 25.6 kHz tick)
+    if (++ifaPrescale >= IFA_PRESCALE_MAX) {
+        ifaPrescale = 0;
+        uint8_t c = pwmCounter++;
+        P1_4 = (c < pwmDuty[0]) ? 1 : 0;
+        P1_5 = (c < pwmDuty[1]) ? 1 : 0;
+        P1_6 = (c < pwmDuty[2]) ? 1 : 0;
+        P1_7 = (c < pwmDuty[3]) ? 1 : 0;
+        P3_1 = (c < pwmDuty[4]) ? 1 : 0;
+        P3_0 = (c < pwmDuty[5]) ? 1 : 0;
+    }
 }
 
 // ============================================================
@@ -76,15 +123,61 @@ void setup() {
 
     pinMode(ACT_LED_PIN, OUTPUT);
     digitalWrite(ACT_LED_PIN, LOW);
+    pinMode(IR_LED_PIN, OUTPUT);
+    digitalWrite(IR_LED_PIN, LOW);
 
-    ifaceInit();
-    // irInit();
-    // parserInit(&parser);
+    ifaceInit();   // starts Timer 2 at 153.85 kHz (shared with the IR engine)
+    irInit();
+    parserInit(&parser);
 }
 
 // ============================================================
 void loop() {
-    // // Parse incoming packets
+    // INTEGRATION TEST: IFA + PF IR cycling, 8 states × 2s each.
+    //
+    // PF data byte for Single Output PWM mode (channel 1, escape=0, addr=0):
+    //   bit 4   = output select (0 = A/red, 1 = B/blue)
+    //   bits 3-0 = PWM step (0 = float, 7 = fwd7, 9 = rev7)
+    //
+    //   Blue fwd  = 0x17    Blue rev  = 0x19    Blue float = 0x10
+    //   Red  fwd  = 0x07    Red  rev  = 0x09    Red  float = 0x00
+    static uint8_t step = 0;
+    static uint8_t duties[6] = {0, 0, 0, 0, 0, 0};
+
+    for (uint8_t i = 0; i < 6; i++) duties[i] = 0;
+    uint8_t pf_data;
+    uint8_t act_led = LOW;
+
+    switch (step) {
+        case 0: duties[0] = 255; pf_data = 0x17; act_led = HIGH; break;  // OUT0 + blue fwd
+        case 1:                  pf_data = 0x10;                 break;  // off  + blue float
+        case 2: duties[1] = 255; pf_data = 0x19; act_led = HIGH; break;  // OUT1 + blue rev
+        case 3:                  pf_data = 0x10;                 break;  // off  + blue float
+        case 4: duties[2] = 255; pf_data = 0x07; act_led = HIGH; break;  // OUT2 + red  fwd
+        case 5:                  pf_data = 0x00;                 break;  // off  + red  float
+        case 6: duties[3] = 255; pf_data = 0x09; act_led = HIGH; break;  // OUT3 + red  rev
+        default:                 pf_data = 0x00;                 break;  // off  + red  float
+    }
+
+    digitalWrite(ACT_LED_PIN, act_led);
+    ifaceSetOutputs(duties, 0x3F);
+
+    // Queue the PF command and kick the engine. The Timer 2 ISR drives the
+    // transmission to completion in the background (~400 ms), so the delay
+    // below doesn't block the IR engine — only this loop.
+    irStartPF(0, PF_MODE_SINGLE_PWM, pf_data, 0);
+    irPoll();
+
+    delay(2000);
+
+    // Drain any IR completion that fired during the dwell so the engine's
+    // completion slot doesn't go stale.
+    uint8_t tok, eng;
+    irGetCompletion(&tok, &eng);
+
+    step = (step + 1) & 0x7;
+
+    // // Normal dispatcher (restore by replacing the test block above):
     // while (USBSerial_available()) {
     //     uint8_t b = USBSerial_read();
     //     actLedPulse();
@@ -94,50 +187,14 @@ void loop() {
     //         handlePacket(&parser.pkt);
     //     }
     // }
-    //
-    // // IR completion events
     // uint8_t token, engine;
     // if (irGetCompletion(&token, &engine)) {
     //     uint8_t payload[2] = { token, engine };
     //     sendReply(0x00, REPLY_IR_DONE, payload, 2);
     // }
-    //
     // actLedTick();
     // irPoll();
     // ifaceEdgePoll();
-
-    // // ISR-BYPASS TEST: directly toggle output 0 without using PWM ISR.
-    // // If output 0 toggles 2s/2s: pin is driveable, ISR is the problem.
-    // // If output 0 stays on: something else is wrong (pinMode / pin mapping).
-    // digitalWrite(IFACE_OUT0_PIN, HIGH);
-    // digitalWrite(ACT_LED_PIN, HIGH);
-    // delay(2000);
-    // digitalWrite(IFACE_OUT0_PIN, LOW);
-    // digitalWrite(ACT_LED_PIN, LOW);
-    // delay(2000);
-
-    static uint8_t duties[6] = {0, 0, 0, 0, 0, 0};
-    for (uint8_t i = 0; i < 6; i++) {
-        duties[i] = 255;
-        ifaceSetOutputs(duties, 0x3F);
-        digitalWrite(ACT_LED_PIN, HIGH);
-        delay(2000);
-        duties[i] = 0;
-        ifaceSetOutputs(duties, 0x3F);
-        digitalWrite(ACT_LED_PIN, LOW);
-        delay(2000);
-    }
-    // static uint8_t duties[6] = {0, 0, 0, 0, 0, 0};
-    // for (uint8_t i = 0; i < 6; i++) {
-    //     duties[i] = 255;
-    //     ifaceSetOutputs(duties, 0x3F);
-    //     digitalWrite(ACT_LED_PIN, HIGH);
-    //     delay(2000);
-    //     duties[i] = 0;
-    //     ifaceSetOutputs(duties, 0x3F);
-    //     digitalWrite(ACT_LED_PIN, LOW);
-    //     delay(2000);
-    // }
 }
 
 // ============================================================

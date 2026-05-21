@@ -13,24 +13,25 @@
 // This uses ~80 bytes of RAM instead of ~1600.
 // ============================================================
 
-// --- PF timing constants (microseconds) ---
-#define PF_MARK_US          158
-#define PF_ZERO_SPACE_US    263
-#define PF_ONE_SPACE_US     553
-#define PF_START_SPACE_US   1026
-#define PF_REPEAT_COUNT     5
-#define PF_GAP_CH0_US       16000
-#define PF_GAP_CH1_US       26000
-#define PF_GAP_CH2_US       36000
-#define PF_GAP_CH3_US       46000
+// --- Protocol timing (in Timer 2 ISR ticks; 1 tick = ~6.5 us @ 153.85 kHz) ---
+// Original microsecond values shown in comments for reference.
+#define PF_MARK_TICKS         24   // 158 us  (6 cycles of 38 kHz)
+#define PF_ZERO_SPACE_TICKS   40   // 263 us
+#define PF_ONE_SPACE_TICKS    85   // 553 us
+#define PF_START_SPACE_TICKS 158   // 1026 us
+#define PF_REPEAT_COUNT        5
+#define PF_GAP_CH0_TICKS    2462   // 16 ms
+#define PF_GAP_CH1_TICKS    4000   // 26 ms
+#define PF_GAP_CH2_TICKS    5538   // 36 ms
+#define PF_GAP_CH3_TICKS    7077   // 46 ms
 
 // --- Legacy timing ---
-#define LEGACY_BIT_US       208
-#define LEGACY_REPEAT_COUNT 5
+#define LEGACY_BIT_TICKS      32   // 208 us
+#define LEGACY_REPEAT_COUNT    5
 
 // --- RCX timing ---
-#define RCX_BIT_US          417
-#define RCX_MAX_FRAMED_BYTES 37  // 3 header + 16*2 data+complement + 2 checksum
+#define RCX_BIT_TICKS         64   // 417 us
+#define RCX_MAX_FRAMED_BYTES  37   // 3 header + 16*2 data+complement + 2 checksum
 
 // --- PF modes ---
 #define PF_MODE_COMBO_DIRECT    0x00
@@ -114,5 +115,24 @@ uint8_t irGetCompletion(uint8_t *token, uint8_t *engine);
 
 // PF toggle state (per channel)
 extern uint8_t pfToggle[4];
+
+// ============================================================
+// Shared state with the unified Timer 2 ISR (defined in BrickInterface.ino).
+// The ISR runs at 153.85 kHz and handles three responsibilities:
+//   - IR carrier toggling (38 kHz / 76 kHz) via carrierMode
+//   - Envelope phase progression via envelopeTicks countdown
+//   - Interface A software PWM tick (every 6th call)
+//
+// ir_engine.c owns these vars; the ISR reads/writes them via these externs.
+// ============================================================
+extern volatile __data uint8_t  carrierMode;       // 0=off, 1=38kHz, 2=76kHz
+extern volatile __data uint8_t  carrierPrescale;   // for 38 kHz (toggle every 2 ISRs)
+extern volatile __data uint16_t envelopeTicks;     // countdown to next phase load
+extern volatile __data uint8_t  completionPending; // set by ISR when transmission ends
+
+// Called from the Timer 2 ISR when envelopeTicks reaches 0. Returns 1 with
+// next phase's carrier_mode and tick count, or 0 when transmission complete
+// (in which case it also clears state.active to release the engine).
+uint8_t irNextPhase(uint8_t *carrier_mode, uint16_t *ticks);
 
 #endif
