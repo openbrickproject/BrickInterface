@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Local working notes (not published)
+/notes/
+
+# Editor / tooling state
+.claude/
+
+# Python virtual environments
+.venv/
+.kicad-mcp-venv/
+__pycache__/
+*.pyc
+
+# Host-built firmware test binaries
+firmware/BrickInterface/tests/test_dispatch
+firmware/BrickInterface/tests/test_ir_legacy
+firmware/BrickInterface/tests/test_ir_pf
+firmware/BrickInterface/tests/test_ir_rcx
+firmware/BrickInterface/tests/test_packet
+
+# KiCad local/per-user state, caches, and auto-backups
+kicad/*.kicad_prl
+kicad/fp-info-cache
+kicad/BrickInterface-backups/
+kicad/analysis/
+kicad/production/backups/
