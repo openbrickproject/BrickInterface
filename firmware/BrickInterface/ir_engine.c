@@ -275,6 +275,14 @@ static uint8_t pfBuildNibbles(uint8_t *nibbles, uint8_t channel, uint8_t mode,
         nibbles[1] = 0x06 | ((data >> 4) & 0x01);
         nibbles[2] = data & 0x0F;
         break;
+    case PF_MODE_COMBO_PWM:
+        // Escape bit forced high selects Combo PWM in the PF protocol.
+        // Nibble 1 = Output B step, nibble 2 = Output A step (both 4-bit).
+        // data = (step_b << 4) | step_a
+        nibbles[0] = ((toggle & 1) << 3) | (1 << 2) | (channel & 0x03);
+        nibbles[1] = (data >> 4) & 0x0F;
+        nibbles[2] = data & 0x0F;
+        break;
     default:
         return 0;
     }

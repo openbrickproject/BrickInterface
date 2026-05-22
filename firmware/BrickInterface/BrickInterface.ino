@@ -194,11 +194,14 @@ static void handlePacket(const Packet *pkt) {
 
     // --- Interface A ---
     case CMD_IFACE_SET_OUTPUTS: {
-        if (pkt->payload_len != 6 && pkt->payload_len != 7) {
-            sendError(pkt->seq, ERR_BAD_LENGTH, 0); break;
+        if (pkt->payload_len < 1) { sendError(pkt->seq, ERR_BAD_LENGTH, 0); break; }
+        uint8_t mask = pkt->payload[0] & 0x3F;
+        uint8_t expected = 1;
+        for (uint8_t i = 0; i < 6; i++) {
+            if (mask & (1 << i)) expected++;
         }
-        uint8_t mask = (pkt->payload_len == 7) ? pkt->payload[6] : 0x3F;
-        ifaceSetOutputs(pkt->payload, mask);
+        if (pkt->payload_len != expected) { sendError(pkt->seq, ERR_BAD_LENGTH, 0); break; }
+        ifaceSetOutputs(mask, pkt->payload + 1);
         sendReply(pkt->seq, REPLY_OK, NULL, 0);
         break;
     }
@@ -296,6 +299,7 @@ static uint8_t isValidPFMode(uint8_t mode) {
         case PF_MODE_COMBO_DIRECT:
         case PF_MODE_SINGLE_PWM:
         case PF_MODE_SINGLE_CST:
+        case PF_MODE_COMBO_PWM:
             return 1;
         default:
             return 0;

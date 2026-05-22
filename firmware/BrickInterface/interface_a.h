@@ -11,10 +11,11 @@ void ifaceInit(void);
 extern volatile __xdata uint8_t pwmDuty[6];
 extern volatile __data    uint8_t pwmCounter;
 
-// Apply 6 PWM duties (0..255) to outputs 0..5. `mask` bit i set = apply
-// duties[i] to output i; bit clear = leave that output untouched. Pass
-// mask = 0x3F to update all six.
-void ifaceSetOutputs(const uint8_t *duties, uint8_t mask);
+// Apply PWM duties to selected outputs. `mask` bit i set = apply the next
+// packed duty byte to output i; bit clear = leave that output untouched.
+// `packed_duties` contains exactly popcount(mask) bytes, one per set bit,
+// in ascending bit order. Pass mask=0x3F with six bytes to update all six.
+void ifaceSetOutputs(uint8_t mask, const uint8_t *packed_duties);
 
 // Force all outputs to 0 (used by RESET_STATE and bootloader entry).
 void ifaceClearAllOutputs(void);

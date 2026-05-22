@@ -75,6 +75,7 @@
 #define PF_MODE_COMBO_DIRECT    0x00
 #define PF_MODE_SINGLE_PWM      0x01
 #define PF_MODE_SINGLE_CST      0x02
+#define PF_MODE_COMBO_PWM       0x03
 
 // --- Parsed packet structure ---
 typedef struct {

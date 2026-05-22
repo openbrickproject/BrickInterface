@@ -77,10 +77,11 @@ void ifaceInit(void) {
 }
 
 // ============================================================
-void ifaceSetOutputs(const uint8_t *duties, uint8_t mask) {
+void ifaceSetOutputs(uint8_t mask, const uint8_t *packed_duties) {
     mask &= 0x3F;
+    uint8_t src = 0;
     for (uint8_t i = 0; i < 6; i++) {
-        if (mask & (1 << i)) pwmDuty[i] = duties[i];
+        if (mask & (1 << i)) pwmDuty[i] = packed_duties[src++];
     }
 }
 
