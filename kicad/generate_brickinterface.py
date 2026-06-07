@@ -534,8 +534,10 @@ def build():
 
     # -- Bootloader entry button --
     # Hold during USB plug-in to force CH552 into ROM bootloader.
-    # +5V -> SW1 -> R9 (10k current limit) -> USB_DP (P3.6).
-    # The 10k limits short-circuit current if user presses during normal USB op.
+    # V33 -> SW1 -> R9 (10k current limit) -> USB_DP (P3.6).
+    # Strap toward V33 (not +5V): USB_DP/P3.6 is a 3.3V pin, so pulling it
+    # to the 5V rail is over-spec. The 10k also limits short-circuit current
+    # if the user presses during normal USB operation.
     SW1 = add("SW", "Switch:SW_Push", "SW1", "BOOT",
               "BrickInterface:SW_TS3315A", 35, 105)
     R9  = add("R",  "Device:R",       "R9",  "10k",
@@ -582,8 +584,8 @@ def build():
     wire_label("USB_DP", U1, "14", 5, 0, 0)   # P3.6 (UDP) — chip pin 14
     wire_label("USB_DP", R9, "2", 5, 0, 0)    # Bootloader pull via R9
 
-    # Bootloader button: +5V -> SW1 -> BOOT_PULL -> R9 -> USB_DP
-    pwr_at("+5V", "power:+5V", SW1, "1")
+    # Bootloader button: V33 -> SW1 -> BOOT_PULL -> R9 -> USB_DP
+    wire_label("V33", SW1, "1", -5, 0, 180)
     wire_label("BOOT_PULL", SW1, "2", 5, 0, 0)
     wire_label("BOOT_PULL", R9, "1", -5, 0, 180)
 
