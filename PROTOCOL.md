@@ -130,7 +130,7 @@ Length must equal `1 + popcount(mask)`, else `ERR_BAD_LENGTH`. There is no read-
 
 ### `IFACE_GET_INPUTS` (`0x11`)
 
-Reports the state of the two inputs. Reply `IFACE_INPUTS` `state`: bit 0 = input 6, bit 1 = input 7. The inputs are pulled up, so the raw bit is `1` when the input is open and `0` when it is closed (pressed, or pulled to ground by a sensor). This inverts the TC Logo and Control Lab boolean, where a pressed touch sensor reports *true*.
+Reports the state of the two inputs. Reply `IFACE_INPUTS` `state`: bit 0 = input 6, bit 1 = input 7. The inputs are pulled up, so the raw bit is `1` when the input is open and `0` when it is closed (pressed, or pulled to ground by a sensor). This inverts the TC Logo boolean, where a pressed touch sensor reports *true*.
 
 ### `IFACE_GET_COUNTS` (`0x12`) / `IFACE_RESET_COUNT` (`0x13`)
 
@@ -151,7 +151,7 @@ Transmits one Power Functions message as a 38 kHz IR burst. Payload `channel`, `
 | Field | Description |
 | --- | --- |
 | `channel` | `0`–`3` (LEGO channels 1–4). `>3` → `ERR_BAD_ARGUMENT`. |
-| `mode` | Interpretation of `data`; see below. |
+| `mode` | Interpretation of `data`; see below. Values outside `0x00`–`0x03` → `ERR_BAD_ARGUMENT`. |
 | `data` | Mode-specific byte. |
 | `flags` | bit 0 = override toggle (use bit 1 as value); bit 1 = toggle value; bits 2–7 reserved, send 0. If bit 0 clear, board auto-toggles per channel. |
 

@@ -61,7 +61,7 @@ void ifaceInit(void) {
     pinMode(IFACE_OUT5_PIN, OUTPUT);
 
     // 9750 sensor inputs are switch-to-ground; enable internal pullups so
-    // open = HIGH (= "true"). Without this they float and read randomly.
+    // open = HIGH (= Logo "false"). Without this they float and read randomly.
     pinMode(IFACE_IN6_PIN, INPUT_PULLUP);
     pinMode(IFACE_IN7_PIN, INPUT_PULLUP);
 

@@ -65,7 +65,7 @@ See **[PROTOCOL.md](PROTOCOL.md)** for the full wire protocol: frame format, com
 
 - **Interface A** (6 PWM outputs, 2 counting inputs) — Working
 - **Power Functions IR** — Working
-- **Legacy IR / RCX IR** — Early implementation, however it's proven unreliable. Not recommendded for use yet.
+- **Legacy IR / RCX IR** — Early implementation, however it's proven unreliable. Not recommended for use yet.
 
 ## License
 
