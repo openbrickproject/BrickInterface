@@ -5,7 +5,9 @@
 
 // --- Framing ---
 #define PROTO_SOF           0xAA
-#define PROTO_MAX_PAYLOAD   32
+// 40 so CMD_RCX_SEND_RAW can carry a fully-framed RCX packet
+// (RCX_MAX_FRAMED_BYTES = 37, plus the carrier byte).
+#define PROTO_MAX_PAYLOAD   40
 
 // --- Commands (host -> device) ---
 #define CMD_PING                0x01
@@ -67,9 +69,9 @@
 
 // --- Version ---
 #define PROTO_VERSION_MAJOR     1
-#define PROTO_VERSION_MINOR     0
+#define PROTO_VERSION_MINOR     1
 #define FW_VERSION_MAJOR        0
-#define FW_VERSION_MINOR        3
+#define FW_VERSION_MINOR        6
 
 // --- PF modes ---
 #define PF_MODE_COMBO_DIRECT    0x00

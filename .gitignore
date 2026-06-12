@@ -1,5 +1,6 @@
 # macOS
 .DS_Store
+._*
 
 # Local working notes (not published)
 /notes/
@@ -26,3 +27,5 @@ kicad/fp-info-cache
 kicad/BrickInterface-backups/
 kicad/analysis/
 kicad/production/backups/
+kicad/production/BrickInterface.zip
+kicad/.history/

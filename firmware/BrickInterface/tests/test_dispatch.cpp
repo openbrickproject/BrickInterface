@@ -50,6 +50,7 @@ static void reset_firmware_state(void) {
     irAbortAll();
     pending.valid = 0;
     state.active = IR_ACTIVE_NONE;
+    completionPending = 0;  // irAbortAll resolves outstanding tokens; drop the event
     pfToggle[0] = pfToggle[1] = pfToggle[2] = pfToggle[3] = 0;
     test_reset_pin_state();
     reset_capture();
@@ -119,39 +120,60 @@ TEST(dispatch_unknown_cmd_returns_error) {
 // Interface A
 // ---------------------------------------------------------------------------
 
-TEST(dispatch_iface_set_outputs_6byte_replies_ok) {
+TEST(dispatch_iface_set_outputs_all_six_replies_ok) {
     reset_firmware_state();
     Packet pkt;
-    uint8_t duties[6] = {10, 20, 30, 40, 50, 60};
-    make_packet(&pkt, 0x10, CMD_IFACE_SET_OUTPUTS, duties, 6);
+    // Payload = mask (all six outputs) + one packed duty byte per set bit.
+    uint8_t p[7] = {0x3F, 10, 20, 30, 40, 50, 60};
+    make_packet(&pkt, 0x10, CMD_IFACE_SET_OUTPUTS, p, 7);
     handlePacket(&pkt);
 
     uint8_t seq, cmd, payload[32], plen;
     ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
     ASSERT_EQ(cmd, REPLY_OK);
+    for (uint8_t i = 0; i < 6; i++) ASSERT_EQ(pwmDuty[i], 10 * (i + 1));
 }
 
-TEST(dispatch_iface_set_outputs_7byte_mask_applies_selectively) {
+TEST(dispatch_iface_set_outputs_mask_applies_selectively) {
     reset_firmware_state();
     // Pre-seed all duties to a known value so we can verify mask leaves
     // some outputs untouched.
     uint8_t base[6] = {99, 99, 99, 99, 99, 99};
-    ifaceSetOutputs(base, 0x3F);
+    ifaceSetOutputs(0x3F, base);
 
     Packet pkt;
-    uint8_t p[7] = {1, 2, 3, 4, 5, 6, 0x05};  // mask = outputs 0 and 2 only
-    make_packet(&pkt, 0x11, CMD_IFACE_SET_OUTPUTS, p, 7);
+    uint8_t p[3] = {0x05, 11, 33};  // mask = outputs 0 and 2 only
+    make_packet(&pkt, 0x11, CMD_IFACE_SET_OUTPUTS, p, 3);
     handlePacket(&pkt);
 
     uint8_t seq, cmd, payload[32], plen;
     ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
     ASSERT_EQ(cmd, REPLY_OK);
+    ASSERT_EQ(pwmDuty[0], 11);
+    ASSERT_EQ(pwmDuty[1], 99);
+    ASSERT_EQ(pwmDuty[2], 33);
+    ASSERT_EQ(pwmDuty[3], 99);
+    ASSERT_EQ(pwmDuty[4], 99);
+    ASSERT_EQ(pwmDuty[5], 99);
 }
 
 TEST(dispatch_iface_set_outputs_bad_length_errors) {
     reset_firmware_state();
     Packet pkt;
     make_packet(&pkt, 0x12, CMD_IFACE_SET_OUTPUTS, NULL, 0);
+    handlePacket(&pkt);
+
+    uint8_t seq, cmd, payload[32], plen;
+    ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
+    ASSERT_EQ(cmd, REPLY_ERROR);
+    ASSERT_EQ(payload[0], ERR_BAD_LENGTH);
+}
+
+TEST(dispatch_iface_set_outputs_duty_count_mismatch_errors) {
+    reset_firmware_state();
+    Packet pkt;
+    uint8_t p[2] = {0x05, 1};  // mask selects 2 outputs but only 1 duty byte
+    make_packet(&pkt, 0x14, CMD_IFACE_SET_OUTPUTS, p, 2);
     handlePacket(&pkt);
 
     uint8_t seq, cmd, payload[32], plen;
@@ -295,6 +317,21 @@ TEST(dispatch_pf_send_rejects_invalid_mode) {
     ASSERT_EQ(payload[0], ERR_BAD_ARGUMENT);
 }
 
+TEST(dispatch_pf_send_rejects_bad_channel) {
+    // Channel > 3 must be ERR_BAD_ARGUMENT per PROTOCOL.md — it used to
+    // fall through to the engine and surface as ERR_BUSY.
+    reset_firmware_state();
+    Packet pkt;
+    uint8_t p[] = {4 /*invalid ch*/, PF_MODE_COMBO_DIRECT, 0x01, 0x01};
+    make_packet(&pkt, 0x24, CMD_PF_SEND, p, 4);
+    handlePacket(&pkt);
+
+    uint8_t seq, cmd, payload[32], plen;
+    ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
+    ASSERT_EQ(cmd, REPLY_ERROR);
+    ASSERT_EQ(payload[0], ERR_BAD_ARGUMENT);
+}
+
 TEST(dispatch_pf_send_accepts_valid_mode) {
     reset_firmware_state();
     Packet pkt;
@@ -372,6 +409,28 @@ TEST(dispatch_legacy_send_accepts_valid_nibbles) {
     ASSERT_EQ(payload[1], IR_ENGINE_LEGACY);
 }
 
+TEST(dispatch_legacy_send_rejects_bad_channel_code) {
+    // channelCode must be 4-7; out-of-range used to surface as ERR_BUSY.
+    reset_firmware_state();
+    Packet pkt;
+    uint8_t seq, cmd, payload[32], plen;
+
+    uint8_t low[] = {3, 0x07, 0x08};
+    make_packet(&pkt, 0x33, CMD_LEGACY_SEND, low, 3);
+    handlePacket(&pkt);
+    ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
+    ASSERT_EQ(cmd, REPLY_ERROR);
+    ASSERT_EQ(payload[0], ERR_BAD_ARGUMENT);
+
+    reset_capture();
+    uint8_t high[] = {8, 0x07, 0x08};
+    make_packet(&pkt, 0x34, CMD_LEGACY_SEND, high, 3);
+    handlePacket(&pkt);
+    ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
+    ASSERT_EQ(cmd, REPLY_ERROR);
+    ASSERT_EQ(payload[0], ERR_BAD_ARGUMENT);
+}
+
 // ---------------------------------------------------------------------------
 // RCX — oversized payload rejection
 // ---------------------------------------------------------------------------
@@ -386,10 +445,37 @@ TEST(dispatch_rcx_send_rejects_too_long) {
 
     uint8_t seq, cmd, payload[32], plen;
     ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
-    // irStartRCX returns 0 for oversized → handler reports ERR_BUSY (the
-    // "couldn't queue" path). Acceptable as the protocol contract — what
-    // matters is that we don't crash or silently truncate.
     ASSERT_EQ(cmd, REPLY_ERROR);
+    ASSERT_EQ(payload[0], ERR_BAD_ARGUMENT);
+}
+
+TEST(dispatch_rcx_send_raw_rejects_too_long) {
+    reset_firmware_state();
+    Packet pkt;
+    // carrier byte + 38 raw bytes — exceeds RCX_MAX_FRAMED_BYTES (37)
+    uint8_t p[39] = {0};
+    make_packet(&pkt, 0x42, CMD_RCX_SEND_RAW, p, 39);
+    handlePacket(&pkt);
+
+    uint8_t seq, cmd, payload[32], plen;
+    ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
+    ASSERT_EQ(cmd, REPLY_ERROR);
+    ASSERT_EQ(payload[0], ERR_BAD_ARGUMENT);
+}
+
+TEST(dispatch_rcx_send_raw_accepts_full_frame) {
+    // A fully-framed 16-data-byte RCX packet is 37 raw bytes; with the
+    // 40-byte payload cap it now fits (carrier byte + 37 = 38).
+    reset_firmware_state();
+    Packet pkt;
+    uint8_t p[38] = {0};
+    make_packet(&pkt, 0x43, CMD_RCX_SEND_RAW, p, 38);
+    handlePacket(&pkt);
+
+    uint8_t seq, cmd, payload[32], plen;
+    ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
+    ASSERT_EQ(cmd, REPLY_IR_ACCEPTED);
+    ASSERT_EQ(payload[1], IR_ENGINE_RCX);
 }
 
 TEST(dispatch_rcx_send_accepts_valid) {
@@ -418,6 +504,32 @@ TEST(dispatch_ir_abort_all_replies_ok) {
     uint8_t seq, cmd, payload[32], plen;
     ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
     ASSERT_EQ(cmd, REPLY_OK);
+}
+
+TEST(dispatch_ir_abort_emits_ir_done_for_aborted_send) {
+    reset_firmware_state();
+    Packet pkt;
+    uint8_t p[] = {0, PF_MODE_COMBO_DIRECT, 0x01, 0x01};
+    make_packet(&pkt, 0x51, CMD_PF_SEND, p, 4);
+    handlePacket(&pkt);
+
+    uint8_t seq, cmd, payload[32], plen;
+    ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
+    ASSERT_EQ(cmd, REPLY_IR_ACCEPTED);
+    uint8_t token = payload[0];
+
+    reset_capture();
+    make_packet(&pkt, 0x52, CMD_IR_ABORT_ALL, NULL, 0);
+    handlePacket(&pkt);
+    ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
+    ASSERT_EQ(cmd, REPLY_OK);
+
+    // The aborted request's token still resolves with exactly one IR_DONE.
+    uint8_t t, e;
+    ASSERT_EQ(irGetCompletion(&t, &e), 1);
+    ASSERT_EQ(t, token);
+    ASSERT_EQ(e, IR_ENGINE_PF);
+    ASSERT_EQ(irGetCompletion(&t, &e), 0);
 }
 
 int main(void) {

@@ -27,4 +27,22 @@
 
 // USB is on P3.6 (D+, chip pin 14) and P3.7 (D-, chip pin 15) — dedicated
 
+// ============================================================
+// Timer 2 tick rates (timer clock = Fsys/12 = 2 MHz, 0.5 us/count)
+// ============================================================
+// Base tick: 26 counts = 13 us (76.92 kHz ISR). The carrier toggles every
+// tick, giving the 38.46 kHz used by PF and RCX. Chosen so the ISR body
+// (~8 us worst case) fits inside one period: at the old 6.5 us tick the
+// ISR overran itself, overflow flags were lost, and every envelope ran
+// ~1.2x slow with a ~31 kHz carrier — close enough for PF receivers
+// (±25% bit tolerance, wideband), fatal for the RCX's 2400 baud UART.
+// Fast tick: 13 counts = 6.5 us (153.85 kHz), armed only while the Legacy
+// engine transmits — toggling every tick then gives its 76.92 kHz carrier.
+// (The ISR still overruns at this rate, so Legacy timing stretches ~1.2x;
+// acceptable until Legacy is hardware-validated.)
+#define T2_RELOAD_BASE_H  0xFF   // 65536 - 26
+#define T2_RELOAD_BASE_L  0xE6
+#define T2_RELOAD_FAST_H  0xFF   // 65536 - 13
+#define T2_RELOAD_FAST_L  0xF3
+
 #endif

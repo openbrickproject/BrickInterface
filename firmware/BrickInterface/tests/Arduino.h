@@ -13,7 +13,10 @@
 #define __data
 #define __code
 #define __sfr
-#define __interrupt(x)
+// Object-like on purpose: the firmware uses the bare `__interrupt` form
+// (vector number supplied by the core's prototype), which a function-like
+// macro would fail to erase.
+#define __interrupt
 #define __using(x)
 // Note: don't redefine __attribute__ here — g++ uses it for real attributes
 // (e.g., test_harness.h's constructor attribute) and the firmware's
@@ -75,6 +78,10 @@ extern volatile uint8_t TH0, TL0, TF0, TR0, ET0;
 extern volatile uint8_t TH1, TL1, TR1, ET1;
 #define bT1_CLK 0x10
 extern volatile uint8_t EA;
+
+// Timer 2 (drives the unified IR/PWM ISR; values irrelevant on host)
+extern volatile uint8_t T2CON, RCAP2H, RCAP2L, TH2, TL2, TF2, ET2;
+#define bT2_CLK 0x40
 
 // USB
 extern volatile uint8_t USB_INT_EN, USB_CTRL, UDEV_CTRL;

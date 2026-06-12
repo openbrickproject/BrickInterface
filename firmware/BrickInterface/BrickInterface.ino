@@ -48,38 +48,40 @@ static uint8_t isValidPFMode(uint8_t mode);
 static uint8_t isValidLegacyNibble(uint8_t value);
 
 // ============================================================
-// Unified Timer 2 ISR — 153.85 kHz.
+// Unified Timer 2 ISR — 76.92 kHz base tick (13 us), 153.85 kHz (6.5 us)
+// while the Legacy engine transmits (see board_config.h).
 //
 // Three responsibilities, all run from the same vector:
 //   (1) IR carrier toggle on P3.4
-//       - carrierMode=2: toggle every ISR → 76.92 kHz output (Legacy)
-//       - carrierMode=1: toggle every 2 ISRs → 38.46 kHz output (PF, RCX)
+//       - carrierMode!=0: toggle every ISR — 38.46 kHz at the base tick
+//         (PF, RCX), 76.92 kHz at the Legacy fast tick
 //       - carrierMode=0: pin held low (spaces, idle)
 //   (2) IR envelope state machine
 //       - decrements envelopeTicks; when it hits 0, calls irNextPhase()
 //         to load the next mark/space duration, or signals completion
 //   (3) Interface A software PWM tick
-//       - every 6th ISR → 25.6 kHz tick rate → 100 Hz PWM at 256 levels
+//       - every 3rd ISR → 39 us tick → ~100 Hz PWM, 255-tick period
+//         (so duty 255 = solid on, duty 0 = solid off)
+//
+// The whole body must finish within ~two tick periods or overflow flags
+// are lost and the envelope stretches (the bug that broke RCX at 6.5 us).
 //
 // SDCC installs the Timer 2 vector via the weak Timer2Interrupt() in
 // ch55xduino's core; our definition here overrides it at link time.
 // (Timer 0 and Timer 1 have no equivalent hook from user code.)
 // ============================================================
-#define IFA_PRESCALE_MAX 6
+#define IFA_PRESCALE_MAX 3
 
 static volatile __data uint8_t ifaPrescale = 0;
 
 void Timer2Interrupt(void) __interrupt {
     TF2 = 0;  // Timer 2 overflow flag is not auto-cleared
+    uint8_t phaseLoaded = 0;
 
-    // (1) Carrier toggle
-    if (carrierMode == 2) {
+    // (1) Carrier toggle — every tick; the frequency comes from the tick
+    // rate, not a prescaler.
+    if (carrierMode) {
         P3_4 = !P3_4;
-    } else if (carrierMode == 1) {
-        if (++carrierPrescale >= 2) {
-            carrierPrescale = 0;
-            P3_4 = !P3_4;
-        }
     }
 
     // (2) Envelope phase progression
@@ -87,9 +89,9 @@ void Timer2Interrupt(void) __interrupt {
         if (--envelopeTicks == 0) {
             uint8_t cm;
             uint16_t ticks;
+            phaseLoaded = 1;
             if (irNextPhase(&cm, &ticks)) {
                 carrierMode = cm;
-                carrierPrescale = 0;
                 if (cm == 0) P3_4 = 0;
                 envelopeTicks = ticks;
             } else {
@@ -98,14 +100,23 @@ void Timer2Interrupt(void) __interrupt {
                 carrierMode = 0;
                 P3_4 = 0;
                 completionPending = 1;
+                // Back to the base tick in case this was a Legacy burst.
+                RCAP2H = T2_RELOAD_BASE_H;
+                RCAP2L = T2_RELOAD_BASE_L;
             }
         }
     }
 
-    // (3) Interface A PWM (every 6th ISR ≈ 25.6 kHz tick)
-    if (++ifaPrescale >= IFA_PRESCALE_MAX) {
+    // (3) Interface A PWM (every 3rd ISR ≈ 39 us tick). Skipped on
+    // phase-load ticks: a phase load plus six pin updates could overrun two
+    // timer periods and lose a tick; a one-tick PWM hiccup once per IR
+    // phase is invisible at 100 Hz.
+    if (!phaseLoaded && ++ifaPrescale >= IFA_PRESCALE_MAX) {
         ifaPrescale = 0;
-        uint8_t c = pwmCounter++;
+        // 255-tick period (counter runs 0..254) so duty 255 = always on and
+        // duty 0 = always off; a 256-tick wrap would leave a notch at 255.
+        uint8_t c = pwmCounter;
+        if (++pwmCounter >= 255) pwmCounter = 0;
         P1_4 = (c < pwmDuty[0]) ? 1 : 0;
         P1_5 = (c < pwmDuty[1]) ? 1 : 0;
         P1_6 = (c < pwmDuty[2]) ? 1 : 0;
@@ -126,7 +137,7 @@ void setup() {
     pinMode(IR_LED_PIN, OUTPUT);
     digitalWrite(IR_LED_PIN, LOW);
 
-    ifaceInit();   // starts Timer 2 at 153.85 kHz (shared with the IR engine)
+    ifaceInit();   // starts Timer 2 at the 13 us base tick (shared with the IR engine)
     irInit();
     parserInit(&parser);
 }
@@ -238,7 +249,10 @@ static void handlePacket(const Packet *pkt) {
     // --- PF ---
     case CMD_PF_SEND: {
         if (pkt->payload_len != 4) { sendError(pkt->seq, ERR_BAD_LENGTH, 0); break; }
-        if (!isValidPFMode(pkt->payload[1])) { sendError(pkt->seq, ERR_BAD_ARGUMENT, 0); break; }
+        if (pkt->payload[0] > 3 || !isValidPFMode(pkt->payload[1])) {
+            sendError(pkt->seq, ERR_BAD_ARGUMENT, 0);
+            break;
+        }
         uint8_t tok = irStartPF(pkt->payload[0], pkt->payload[1],
                                 pkt->payload[2], pkt->payload[3]);
         if (!tok) { sendError(pkt->seq, ERR_BUSY, 0); break; }
@@ -250,7 +264,8 @@ static void handlePacket(const Packet *pkt) {
     // --- Legacy ---
     case CMD_LEGACY_SEND: {
         if (pkt->payload_len != 3) { sendError(pkt->seq, ERR_BAD_LENGTH, 0); break; }
-        if (!isValidLegacyNibble(pkt->payload[1]) || !isValidLegacyNibble(pkt->payload[2])) {
+        if (pkt->payload[0] < 4 || pkt->payload[0] > 7 ||
+            !isValidLegacyNibble(pkt->payload[1]) || !isValidLegacyNibble(pkt->payload[2])) {
             sendError(pkt->seq, ERR_BAD_ARGUMENT, 0);
             break;
         }
@@ -274,6 +289,7 @@ static void handlePacket(const Packet *pkt) {
 
     case CMD_RCX_SEND_RAW: {
         if (pkt->payload_len < 2) { sendError(pkt->seq, ERR_BAD_LENGTH, 0); break; }
+        if ((pkt->payload_len - 1) > RCX_MAX_FRAMED_BYTES) { sendError(pkt->seq, ERR_BAD_ARGUMENT, 0); break; }
         uint8_t tok = irStartRCXRaw(&pkt->payload[1], pkt->payload_len - 1, pkt->payload[0]);
         if (!tok) { sendError(pkt->seq, ERR_BUSY, 0); break; }
         uint8_t p[2] = { tok, IR_ENGINE_RCX };

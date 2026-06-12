@@ -1,4 +1,0 @@
-#!/bin/sh
-# Wrapper that runs dance.py inside the local venv.
-d=$(cd "$(dirname "$0")" && pwd)
-exec "$d/.venv/bin/python3" "$d/dance.py" "$@"

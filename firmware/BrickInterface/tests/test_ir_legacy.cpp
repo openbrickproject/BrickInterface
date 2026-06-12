@@ -38,7 +38,7 @@ TEST(legacy_frame_starts_with_mark) {
     ASSERT_TRUE(n > 0);
     // First bit (bit 0 = start) should be a mark (carrier ON)
     ASSERT_EQ(phases[0].carrier, 1);
-    ASSERT_EQ(phases[0].duration, LEGACY_BIT_US);
+    ASSERT_EQ(phases[0].duration, LEGACY_BIT_TICKS);
 }
 
 TEST(legacy_frame_has_correct_bit_length) {
@@ -69,8 +69,9 @@ TEST(legacy_inter_message_gap_after_first_frame) {
     (void)n;
     // After 22 bits (frame done), next phase is gap
     ASSERT_EQ(phases[22].carrier, 0);
-    // Gap duration for channel 4: 51 ms minus message duration ~4.6 ms
-    ASSERT_TRUE(phases[22].duration > 40000);
+    // Channel 4 spacing is 51 ms start-to-start (7846 ticks); the emitted
+    // gap is that minus the 22-bit message window.
+    ASSERT_EQ(phases[22].duration, 7846 - 22 * LEGACY_BIT_TICKS);
 }
 
 TEST(legacy_check_digit_makes_sum_modulo_16_zero) {
@@ -78,6 +79,21 @@ TEST(legacy_check_digit_makes_sum_modulo_16_zero) {
     uint8_t channel = 5, orange = 0x07, yellow = 0x0F;
     uint8_t check = (0x10 - (channel + orange + yellow)) & 0x0F;
     ASSERT_EQ(((channel + orange + yellow + check) & 0x0F), 0);
+}
+
+TEST(legacy_arms_fast_tick_and_abort_restores_base) {
+    // Legacy needs the 6.5 us Timer 2 tick for its 76.92 kHz carrier; abort
+    // (like ISR completion) must restore the 13 us base tick.
+    irAbortAll();              // clear state left behind by direct-state tests
+    completionPending = 0;
+    uint8_t tok = irStartLegacy(4, 0x07, 0x08);
+    ASSERT_TRUE(tok != 0);
+    irPoll();
+    ASSERT_EQ(RCAP2H, T2_RELOAD_FAST_H);
+    ASSERT_EQ(RCAP2L, T2_RELOAD_FAST_L);
+    irAbortAll();
+    ASSERT_EQ(RCAP2L, T2_RELOAD_BASE_L);
+    completionPending = 0;
 }
 
 int main(void) {

@@ -76,6 +76,7 @@ volatile uint8_t PWM_CTRL = 0;
 volatile uint8_t TMOD = 0, T2MOD = 0;
 volatile uint8_t TH0 = 0, TL0 = 0, TF0 = 0, TR0 = 0, ET0 = 0;
 volatile uint8_t TH1 = 0, TL1 = 0, TR1 = 0, ET1 = 0;
+volatile uint8_t T2CON = 0, RCAP2H = 0, RCAP2L = 0, TH2 = 0, TL2 = 0, TF2 = 0, ET2 = 0;
 volatile uint8_t EA = 0;
 
 volatile uint8_t USB_INT_EN = 0, USB_CTRL = 0, UDEV_CTRL = 0;

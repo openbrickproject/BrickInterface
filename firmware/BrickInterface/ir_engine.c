@@ -6,17 +6,19 @@
 // ============================================================
 // Streaming IR engine for CH552T — Timer 2 unified ISR architecture.
 //
-// The Timer 2 ISR (defined in BrickInterface.ino) runs at 153.85 kHz and:
-//   - toggles P3.4 every ISR (carrier mode 2 = 76 kHz output, for Legacy)
-//   - toggles P3.4 every 2 ISRs (carrier mode 1 = 38 kHz output, for PF/RCX)
+// The Timer 2 ISR (defined in BrickInterface.ino) runs at the 13 us base
+// tick (6.5 us while Legacy transmits — see board_config.h) and:
+//   - toggles P3.4 every ISR when carrierMode != 0 (38.46 kHz at the base
+//     tick for PF/RCX, 76.92 kHz at the Legacy fast tick)
 //   - leaves P3.4 low (carrier mode 0 = off, for spaces and idle)
 // and counts down `envelopeTicks` every ISR. When it hits 0, the ISR calls
 // irNextPhase() to load the next mark/space phase. When the protocol-
 // specific nextPhase returns 0, the ISR signals completion via the
 // `completionPending` flag and clears state.active.
 //
-// All envelope durations are expressed in Timer 2 ticks (6.5 us each), not
-// microseconds. This avoids any conversion math inside the ISR.
+// All envelope durations are expressed in Timer 2 ticks (13 us each at the
+// base rate; Legacy's are 6.5 us fast ticks), not microseconds. This avoids
+// any conversion math inside the ISR.
 //
 // We do NOT touch the CH552 PWM module or Timer 0 anymore. The old design
 // tried to drive the carrier via PWM2 (couldn't reach 38 kHz cleanly) and
@@ -28,7 +30,6 @@
 // Shared state with the Timer 2 ISR
 // ============================================================
 volatile __data uint8_t  carrierMode      = 0;
-volatile __data uint8_t  carrierPrescale  = 0;
 volatile __data uint16_t envelopeTicks    = 0;
 volatile __data uint8_t  completionPending = 0;
 
@@ -42,6 +43,18 @@ static volatile uint8_t completionEngine = 0;
 static uint8_t tokenCounter = 1;
 
 uint8_t pfToggle[4] = {0, 0, 0, 0};
+
+// RCX carrier select (payload byte 0 of CMD_RCX_SEND/_RAW): Timer 2 reload
+// low byte (high byte is always 0xFF) and the matching ~416 us bit length.
+// A diagnostic knob for finding the receivers' real passband against the
+// CH552's internal-RC oscillator; 0 is the production default.
+//   sel 0: 26 counts -> 13.0 us half-period -> 38.46 kHz, bit 32 (416 us)
+//   sel 1: 27 counts -> 13.5 us             -> 37.04 kHz, bit 31 (418 us)
+//   sel 2: 25 counts -> 12.5 us             -> 40.00 kHz, bit 33 (412 us)
+//   sel 3: 28 counts -> 14.0 us             -> 35.71 kHz, bit 30 (420 us)
+#define RCX_CARRIER_SELECTS 4
+static const uint8_t rcxCarrierReloadL[RCX_CARRIER_SELECTS]  = { 0xE6, 0xE5, 0xE7, 0xE4 };
+static const uint8_t rcxCarrierBitTicks[RCX_CARRIER_SELECTS] = { 32, 31, 33, 30 };
 
 // ============================================================
 // Helpers
@@ -68,6 +81,7 @@ static uint8_t pfNextPhase(uint8_t *carrier_on, uint16_t *ticks) {
         *carrier_on = 1;
         *ticks = PF_MARK_TICKS;
         s->phase = 1;
+        s->elapsed += PF_MARK_TICKS;
         return 1;
     }
 
@@ -79,6 +93,7 @@ static uint8_t pfNextPhase(uint8_t *carrier_on, uint16_t *ticks) {
         *carrier_on = 0;
         *ticks = PF_START_SPACE_TICKS;
         s->pos = 1;
+        s->elapsed += PF_START_SPACE_TICKS;
         return 1;
     }
 
@@ -91,6 +106,7 @@ static uint8_t pfNextPhase(uint8_t *carrier_on, uint16_t *ticks) {
         *carrier_on = 0;
         *ticks = bit ? PF_ONE_SPACE_TICKS : PF_ZERO_SPACE_TICKS;
         s->pos++;
+        s->elapsed += *ticks;
         return 1;
     }
 
@@ -100,19 +116,20 @@ static uint8_t pfNextPhase(uint8_t *carrier_on, uint16_t *ticks) {
         return 0;  // Done
     }
 
-    // Inter-message gap
-    uint16_t gap;
-    switch (s->channel) {
-        case 0: gap = PF_GAP_CH0_TICKS; break;
-        case 1: gap = PF_GAP_CH1_TICKS; break;
-        case 2: gap = PF_GAP_CH2_TICKS; break;
-        case 3: gap = PF_GAP_CH3_TICKS; break;
-        default: gap = PF_GAP_CH0_TICKS; break;
+    // Inter-message gap, timed start-to-start per PF RC v1.20: 5*tm after
+    // messages 1 and 2, (6 + 2*Ch)*tm after messages 3 and 4. The gap phase
+    // is the spacing target minus the ticks this message consumed.
+    {
+        uint16_t target = (s->repeat <= 2)
+            ? (uint16_t)(5 * PF_TM_TICKS)
+            : (uint16_t)((6 + 2 * s->channel) * PF_TM_TICKS);
+        *carrier_on = 0;
+        *ticks = (target > s->elapsed) ? (target - s->elapsed)
+                                       : PF_START_SPACE_TICKS;
+        s->pos = 0;      // Reset for next repeat
+        s->elapsed = 0;  // Gap is not part of the next message
+        return 1;
     }
-    *carrier_on = 0;
-    *ticks = gap;
-    s->pos = 0;  // Reset for next repeat
-    return 1;
 }
 
 static uint8_t legacyNextPhase(uint8_t *carrier_on, uint16_t *ticks) {
@@ -172,9 +189,22 @@ static uint8_t legacyNextPhase(uint8_t *carrier_on, uint16_t *ticks) {
 static uint8_t rcxNextPhase(uint8_t *carrier_on, uint16_t *ticks) {
     RCXState *s = (RCXState *)&state.rcx;
 
-    if (s->byteIdx >= s->byteCount) return 0;
+    if (s->byteIdx >= s->byteCount) {
+        // Frame finished. More blind repeats? Rewind and emit the
+        // inter-repeat gap (the brick's deaf window) as one space phase;
+        // the next call starts the frame over.
+        if (s->repeat > 1) {
+            s->repeat--;
+            s->byteIdx = 0;
+            s->bitIdx = 0;
+            *carrier_on = 0;
+            *ticks = RCX_REPEAT_GAP_TICKS;
+            return 1;
+        }
+        return 0;
+    }
 
-    *ticks = RCX_BIT_TICKS;
+    *ticks = s->bitTicks;
     uint8_t byte = s->bytes[s->byteIdx];
 
     if (s->bitIdx == 0) {
@@ -250,6 +280,20 @@ static uint8_t pfLRC(uint8_t n0, uint8_t n1, uint8_t n2) {
 
 static uint8_t pfBuildNibbles(uint8_t *nibbles, uint8_t channel, uint8_t mode,
                                uint8_t data, uint8_t flags) {
+    if (mode == PF_MODE_COMBO_PWM) {
+        // Combo PWM: nibble 1 is "a 1 C C" — the toggle bit position carries
+        // the ADDRESS bit instead (PF RC v1.20), and stock receivers only
+        // listen on address 0. Always send 0 and leave the channel's toggle
+        // state untouched (toggle is not verified in this mode).
+        // Nibble 2 = Output B step, nibble 3 = Output A step (both 4-bit).
+        // data = (step_b << 4) | step_a
+        nibbles[0] = (1 << 2) | (channel & 0x03);
+        nibbles[1] = (data >> 4) & 0x0F;
+        nibbles[2] = data & 0x0F;
+        nibbles[3] = pfLRC(nibbles[0], nibbles[1], nibbles[2]);
+        return 1;
+    }
+
     uint8_t toggle;
     if (flags & 0x01) {
         toggle = (flags >> 1) & 1;
@@ -257,30 +301,23 @@ static uint8_t pfBuildNibbles(uint8_t *nibbles, uint8_t channel, uint8_t mode,
         toggle = pfToggle[channel];
         pfToggle[channel] ^= 1;
     }
-    uint8_t escape = (flags >> 2) & 1;
 
+    // The escape bit (nibble 1 bit 2) means "this is a Combo PWM message";
+    // it must be 0 for every other mode, so it is not host-settable.
     switch (mode) {
     case PF_MODE_COMBO_DIRECT:
-        nibbles[0] = ((toggle & 1) << 3) | ((escape & 1) << 2) | (channel & 0x03);
+        nibbles[0] = ((toggle & 1) << 3) | (channel & 0x03);
         nibbles[1] = 0x01;
         nibbles[2] = data & 0x0F;
         break;
     case PF_MODE_SINGLE_PWM:
-        nibbles[0] = ((toggle & 1) << 3) | ((escape & 1) << 2) | (channel & 0x03);
+        nibbles[0] = ((toggle & 1) << 3) | (channel & 0x03);
         nibbles[1] = 0x04 | ((data >> 4) & 0x01);
         nibbles[2] = data & 0x0F;
         break;
     case PF_MODE_SINGLE_CST:
-        nibbles[0] = ((toggle & 1) << 3) | ((escape & 1) << 2) | (channel & 0x03);
+        nibbles[0] = ((toggle & 1) << 3) | (channel & 0x03);
         nibbles[1] = 0x06 | ((data >> 4) & 0x01);
-        nibbles[2] = data & 0x0F;
-        break;
-    case PF_MODE_COMBO_PWM:
-        // Escape bit forced high selects Combo PWM in the PF protocol.
-        // Nibble 1 = Output B step, nibble 2 = Output A step (both 4-bit).
-        // data = (step_b << 4) | step_a
-        nibbles[0] = ((toggle & 1) << 3) | (1 << 2) | (channel & 0x03);
-        nibbles[1] = (data >> 4) & 0x0F;
         nibbles[2] = data & 0x0F;
         break;
     default:
@@ -307,7 +344,6 @@ void irInit(void) {
     pending.valid = 0;
     completionPending = 0;
     carrierMode = 0;
-    carrierPrescale = 0;
     envelopeTicks = 0;
     tokenCounter = 1;
 }
@@ -329,11 +365,25 @@ void irAbortAll(void) {
     ET2 = 0;
     envelopeTicks = 0;
     carrierMode = 0;
-    carrierPrescale = 0;
     P3_4 = 0;
+    // Restore the base tick in case a Legacy burst was in flight.
+    RCAP2H = T2_RELOAD_BASE_H;
+    RCAP2L = T2_RELOAD_BASE_L;
+    // Resolve the outstanding token, if any, so every IR_ACCEPTED produces
+    // exactly one IR_DONE even when the burst is aborted. At most one of
+    // {state, pending} holds a token (single-slot queue); a completion that
+    // already fired but hasn't been drained by the main loop is left intact.
+    if (state.active != IR_ACTIVE_NONE) {
+        completionToken = state.token;
+        completionEngine = state.engine;
+        completionPending = 1;
+    } else if (pending.valid) {
+        completionToken = pending.token;
+        completionEngine = pending.engine;
+        completionPending = 1;
+    }
     state.active = IR_ACTIVE_NONE;
     pending.valid = 0;
-    completionPending = 0;
     ET2 = 1;
 }
 
@@ -363,6 +413,7 @@ void irPoll(void) {
         state.pf.repeat = 0;
         state.pf.pos = 0;
         state.pf.phase = 0;
+        state.pf.elapsed = 0;
         break;
 
     case IR_ACTIVE_LEGACY:
@@ -390,6 +441,8 @@ void irPoll(void) {
         state.rcx.byteCount = pending.rcx.count;
         state.rcx.byteIdx = 0;
         state.rcx.bitIdx = 0;
+        state.rcx.bitTicks = pending.rcx.bitTicks;
+        state.rcx.repeat = pending.rcx.repeats;
         break;
 
     default:
@@ -397,14 +450,38 @@ void irPoll(void) {
         return;
     }
 
+    // Arm the tick rate for this engine: Legacy runs the fast (6.5 us)
+    // tick for its 76.92 kHz carrier, RCX its per-send carrier select, and
+    // PF the 13 us base tick. Takes effect at the next timer overflow.
+    if (pending.engineType == IR_ACTIVE_LEGACY) {
+        RCAP2H = T2_RELOAD_FAST_H;
+        RCAP2L = T2_RELOAD_FAST_L;
+    } else if (pending.engineType == IR_ACTIVE_RCX) {
+        RCAP2H = 0xFF;
+        RCAP2L = pending.rcx.reloadL;
+    } else {
+        RCAP2H = T2_RELOAD_BASE_H;
+        RCAP2L = T2_RELOAD_BASE_L;
+    }
+
+    // PF RC v1.20: "The delay before transmitting the first message is
+    // (4 - Ch)*tm" — a channel-staggered head start so transmitters keyed
+    // in the same instant on different channels miss each other's first
+    // message. Implemented by priming the silent countdown below with the
+    // delay instead of 1 tick. Other engines start immediately.
+    uint16_t primeTicks = 1;
+    if (pending.engineType == IR_ACTIVE_PF) {
+        primeTicks = (uint16_t)(4 - pending.pf.channel) * PF_TM_TICKS;
+    }
+
     pending.valid = 0;
 
-    // Prime the envelope state machine. envelopeTicks=1 means the ISR
-    // will load the first phase on its very next tick. Set this last so
-    // the ISR doesn't try to advance before state is fully initialized.
+    // Prime the envelope state machine: the ISR counts envelopeTicks down
+    // in silence (carrierMode=0), then loads the first phase. Set this
+    // last so the ISR doesn't try to advance before state is fully
+    // initialized.
     carrierMode = 0;
-    carrierPrescale = 0;
-    envelopeTicks = 1;
+    envelopeTicks = primeTicks;
 }
 
 // --- Enqueue functions ---
@@ -441,8 +518,18 @@ uint8_t irStartLegacy(uint8_t channelCode, uint8_t orange, uint8_t yellow) {
     return token;
 }
 
-uint8_t irStartRCX(const uint8_t *data, uint8_t dataLen, uint8_t carrierMode_unused) {
-    (void)carrierMode_unused;
+// Unpack the RCX options byte (low nibble carrier, high nibble repeats).
+static void rcxParseOptions(uint8_t options) {
+    uint8_t carrierSel = options & 0x0F;
+    uint8_t repeats = (options >> 4) & 0x0F;
+    if (carrierSel >= RCX_CARRIER_SELECTS) carrierSel = 0;
+    if (repeats == 0) repeats = 1;
+    pending.rcx.reloadL = rcxCarrierReloadL[carrierSel];
+    pending.rcx.bitTicks = rcxCarrierBitTicks[carrierSel];
+    pending.rcx.repeats = repeats;
+}
+
+uint8_t irStartRCX(const uint8_t *data, uint8_t dataLen, uint8_t options) {
     if (dataLen == 0 || dataLen > 16) return 0;
     if (state.active != IR_ACTIVE_NONE || pending.valid) return 0;
 
@@ -468,12 +555,12 @@ uint8_t irStartRCX(const uint8_t *data, uint8_t dataLen, uint8_t carrierMode_unu
     pending.engineType = IR_ACTIVE_RCX;
     for (uint8_t i = 0; i < pos; i++) pending.rcx.bytes[i] = framed[i];
     pending.rcx.count = pos;
+    rcxParseOptions(options);
     pending.valid = 1;
     return token;
 }
 
-uint8_t irStartRCXRaw(const uint8_t *rawBytes, uint8_t rawLen, uint8_t carrierMode_unused) {
-    (void)carrierMode_unused;
+uint8_t irStartRCXRaw(const uint8_t *rawBytes, uint8_t rawLen, uint8_t options) {
     if (rawLen == 0 || rawLen > RCX_MAX_FRAMED_BYTES) return 0;
     if (state.active != IR_ACTIVE_NONE || pending.valid) return 0;
 
@@ -483,6 +570,7 @@ uint8_t irStartRCXRaw(const uint8_t *rawBytes, uint8_t rawLen, uint8_t carrierMo
     pending.engineType = IR_ACTIVE_RCX;
     for (uint8_t i = 0; i < rawLen; i++) pending.rcx.bytes[i] = rawBytes[i];
     pending.rcx.count = rawLen;
+    rcxParseOptions(options);
     pending.valid = 1;
     return token;
 }

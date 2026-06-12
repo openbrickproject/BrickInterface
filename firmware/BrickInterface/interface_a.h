@@ -2,12 +2,14 @@
 #define INTERFACE_A_H
 
 #include <stdint.h>
+#include <Arduino.h>   // __data/__xdata qualifiers (ch55xduino on target, stub in tests)
 #include "board_config.h"
 
 void ifaceInit(void);
 
-// PWM state shared with the Timer 1 ISR. The ISR itself lives in the .ino
-// translation unit (SDCC vector installation requirement) and accesses these.
+// PWM state shared with the unified Timer 2 ISR. The ISR itself lives in the
+// .ino translation unit (SDCC vector installation requirement) and accesses
+// these.
 extern volatile __xdata uint8_t pwmDuty[6];
 extern volatile __data    uint8_t pwmCounter;
 
