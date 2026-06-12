@@ -5,9 +5,6 @@
 # Local working notes (not published)
 /notes/
 
-# Editor / tooling state
-.claude/
-
 # Python virtual environments
 .venv/
 .kicad-mcp-venv/
