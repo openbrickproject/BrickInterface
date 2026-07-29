@@ -13,10 +13,17 @@ volatile __data uint8_t pwmCounter = 0;
 
 // Per-input edge-counter state. Indexed by 0 (input 6) and 1 (input 7).
 // Polled from the main loop via `ifaceEdgePoll()`. Declared here so
-// `ifaceInit()` can seed `inputPrev[]` from the actual current pin levels.
+// `ifaceInit()` can seed the levels from the actual current pin state.
 static __xdata uint32_t inputCount[2] = {0, 0};
-// Last-seen wire level. Pulled-up = HIGH = open = Logo "false".
+// Debounced wire level. Pulled-up = HIGH = open = Logo "false".
 static __data uint8_t inputPrev[2]    = {1, 1};
+// Raw level from the last poll, and when it last flipped (truncated millis).
+// A raw level must hold IFACE_DEBOUNCE_MS before it becomes the debounced
+// level, filtering mechanical switch bounce on both press and release. The
+// 16-bit timestamps are wrap-safe: the flip-to-commit interval is bounded by
+// the debounce window, far below the 65 s wrap.
+static __data uint8_t inputRaw[2]     = {1, 1};
+static __xdata uint16_t inputChangeMs[2] = {0, 0};
 
 // The PWM tick runs inside the unified Timer 2 ISR in BrickInterface.ino —
 // SDCC requires the ISR definition in the same translation unit as main()
@@ -68,9 +75,10 @@ void ifaceInit(void) {
     for (uint8_t i = 0; i < 6; i++) pwmDuty[i] = 0;
 
     // Snapshot the input pin levels so the first edge poll doesn't count a
-    // spurious transition based on the static-init `inputPrev` value.
-    inputPrev[0] = digitalRead(IFACE_IN6_PIN) ? 1 : 0;
-    inputPrev[1] = digitalRead(IFACE_IN7_PIN) ? 1 : 0;
+    // spurious transition based on the static-init values.
+    inputRaw[0] = inputPrev[0] = digitalRead(IFACE_IN6_PIN) ? 1 : 0;
+    inputRaw[1] = inputPrev[1] = digitalRead(IFACE_IN7_PIN) ? 1 : 0;
+    inputChangeMs[0] = inputChangeMs[1] = (uint16_t)millis();
     inputCount[0] = 0;
     inputCount[1] = 0;
 
@@ -108,15 +116,29 @@ static uint8_t input_idx(uint8_t input) {
     return (input == 7) ? 1 : 0;
 }
 
-// Apply a single edge sample. Public for unit-test access — ISR-free design
-// means the test harness can drive transitions deterministically by calling
-// this with synthetic levels.
+// Apply a single raw level sample, with debouncing. Public for unit-test
+// access — ISR-free design means the test harness can drive transitions
+// deterministically by calling this with synthetic levels and a fake clock.
 void ifaceCountEdge(uint8_t idx, uint8_t newLevel) {
     if (idx >= 2) return;
-    // false->true (Logo) = HIGH->LOW (wire), since the input has an internal
-    // pullup and the sensor pulls to ground when active (dark / pressed).
-    if (inputPrev[idx] && !newLevel) inputCount[idx]++;
-    inputPrev[idx] = newLevel ? 1 : 0;
+    newLevel = newLevel ? 1 : 0;
+
+    // Any raw flip restarts the stability window.
+    if (newLevel != inputRaw[idx]) {
+        inputRaw[idx] = newLevel;
+        inputChangeMs[idx] = (uint16_t)millis();
+        return;
+    }
+
+    // Adopt the level once it has held for the full debounce window.
+    if (newLevel != inputPrev[idx] &&
+        (uint16_t)((uint16_t)millis() - inputChangeMs[idx]) >= IFACE_DEBOUNCE_MS) {
+        // false->true (Logo) = HIGH->LOW (wire), since the input has an
+        // internal pullup and the sensor pulls to ground when active
+        // (dark / pressed).
+        if (inputPrev[idx] && !newLevel) inputCount[idx]++;
+        inputPrev[idx] = newLevel;
+    }
 }
 
 void ifaceEdgePoll(void) {

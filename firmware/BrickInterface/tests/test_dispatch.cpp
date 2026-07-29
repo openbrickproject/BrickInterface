@@ -26,23 +26,39 @@ static void make_packet(Packet *pkt, uint8_t seq, uint8_t cmd,
     if (payload && len) memcpy(pkt->payload, payload, len);
 }
 
+// Decode the reply frame starting at offset `pos` in the Serial capture.
+// Returns the offset of the next frame, or 0 if no valid frame is there.
+static uint16_t decode_frame_at(uint16_t pos, uint8_t *seq, uint8_t *cmd,
+                                uint8_t *payload, uint8_t *payload_len) {
+    if (Serial.tx_len < (uint16_t)(pos + 5)) return 0;
+    if (Serial.tx_buf[pos] != 0xAA) return 0;
+    uint8_t len = Serial.tx_buf[pos + 1];
+    if (Serial.tx_len < (uint16_t)(pos + 2 + len + 1)) return 0;
+    *seq = Serial.tx_buf[pos + 2];
+    *cmd = Serial.tx_buf[pos + 3];
+    *payload_len = len - 2;
+    if (*payload_len) memcpy(payload, &Serial.tx_buf[pos + 4], *payload_len);
+    // Verify checksum
+    uint8_t chk = len ^ *seq ^ *cmd;
+    for (uint8_t i = 0; i < *payload_len; i++) chk ^= payload[i];
+    if (chk != Serial.tx_buf[pos + 2 + len]) return 0;
+    return pos + 2 + len + 1;
+}
+
 // Decode the first reply frame from Serial capture into seq/cmd/payload[].
 // Returns 1 if a valid frame was found, 0 otherwise.
 static uint8_t decode_first_reply(uint8_t *seq, uint8_t *cmd,
                                   uint8_t *payload, uint8_t *payload_len) {
-    if (Serial.tx_len < 5) return 0;
-    if (Serial.tx_buf[0] != 0xAA) return 0;
-    uint8_t len = Serial.tx_buf[1];
-    if (Serial.tx_len < (uint16_t)(2 + len + 1)) return 0;
-    *seq = Serial.tx_buf[2];
-    *cmd = Serial.tx_buf[3];
-    *payload_len = len - 2;
-    if (*payload_len) memcpy(payload, &Serial.tx_buf[4], *payload_len);
-    // Verify checksum
-    uint8_t chk = len ^ *seq ^ *cmd;
-    for (uint8_t i = 0; i < *payload_len; i++) chk ^= payload[i];
-    if (chk != Serial.tx_buf[2 + len]) return 0;
-    return 1;
+    return decode_frame_at(0, seq, cmd, payload, payload_len) != 0;
+}
+
+// Drive one debounced level transition on a counter input: present the new
+// raw level, advance the fake clock past the debounce window, poll again to
+// commit it.
+static void settle_edge(uint8_t idx, uint8_t level) {
+    ifaceCountEdge(idx, level);
+    test_now_ms += IFACE_DEBOUNCE_MS + 1;
+    ifaceCountEdge(idx, level);
 }
 
 // Reset firmware state between tests to keep them independent.
@@ -219,12 +235,12 @@ TEST(dispatch_iface_get_counts_reflects_edge_increments) {
     reset_firmware_state();
     ifaceResetCount(6); ifaceResetCount(7);
     // Three false->true edges on input 6 (idx 0): high, low, high, low, high, low
-    ifaceCountEdge(0, 1);  // baseline high — no count
-    ifaceCountEdge(0, 0);  // edge 1
-    ifaceCountEdge(0, 1);
-    ifaceCountEdge(0, 0);  // edge 2
-    ifaceCountEdge(0, 1);
-    ifaceCountEdge(0, 0);  // edge 3
+    settle_edge(0, 1);  // baseline high — no count
+    settle_edge(0, 0);  // edge 1
+    settle_edge(0, 1);
+    settle_edge(0, 0);  // edge 2
+    settle_edge(0, 1);
+    settle_edge(0, 0);  // edge 3
 
     Packet pkt;
     make_packet(&pkt, 0x31, CMD_IFACE_GET_COUNTS, NULL, 0);
@@ -245,8 +261,8 @@ TEST(dispatch_iface_reset_count_zeros_one_port) {
     reset_firmware_state();
     ifaceResetCount(6); ifaceResetCount(7);
     // Increment both inputs.
-    ifaceCountEdge(0, 1); ifaceCountEdge(0, 0);
-    ifaceCountEdge(1, 1); ifaceCountEdge(1, 0);
+    settle_edge(0, 1); settle_edge(0, 0);
+    settle_edge(1, 1); settle_edge(1, 0);
 
     Packet pkt;
     uint8_t p[] = {6};
@@ -289,8 +305,8 @@ TEST(dispatch_iface_reset_count_bad_length_errors) {
 
 TEST(dispatch_reset_state_zeros_counters) {
     reset_firmware_state();
-    ifaceCountEdge(0, 1); ifaceCountEdge(0, 0);
-    ifaceCountEdge(1, 1); ifaceCountEdge(1, 0);
+    settle_edge(0, 1); settle_edge(0, 0);
+    settle_edge(1, 1); settle_edge(1, 0);
 
     Packet pkt;
     make_packet(&pkt, 0x36, CMD_RESET_STATE, NULL, 0);
@@ -298,6 +314,36 @@ TEST(dispatch_reset_state_zeros_counters) {
 
     ASSERT_EQ(ifaceGetCount(6), 0);
     ASSERT_EQ(ifaceGetCount(7), 0);
+}
+
+TEST(iface_counter_debounces_contact_bounce) {
+    reset_firmware_state();
+    ifaceResetCount(6); ifaceResetCount(7);
+    settle_edge(0, 1);  // idle high (open)
+
+    // Press with contact bounce: rapid H->L->H->L flips inside the debounce
+    // window must register as ONE count once the level finally holds low.
+    ifaceCountEdge(0, 0);
+    test_now_ms += 1; ifaceCountEdge(0, 1);
+    test_now_ms += 1; ifaceCountEdge(0, 0);
+    test_now_ms += 1; ifaceCountEdge(0, 1);
+    test_now_ms += 1; ifaceCountEdge(0, 0);
+    test_now_ms += IFACE_DEBOUNCE_MS + 1;
+    ifaceCountEdge(0, 0);
+    ASSERT_EQ(ifaceGetCount(6), 1);
+
+    // Release with bounce: rising edges never count, and the bounce's brief
+    // low dips must not count either.
+    ifaceCountEdge(0, 1);
+    test_now_ms += 1; ifaceCountEdge(0, 0);
+    test_now_ms += 1; ifaceCountEdge(0, 1);
+    test_now_ms += IFACE_DEBOUNCE_MS + 1;
+    ifaceCountEdge(0, 1);
+    ASSERT_EQ(ifaceGetCount(6), 1);
+
+    // Next clean press counts again.
+    settle_edge(0, 0);
+    ASSERT_EQ(ifaceGetCount(6), 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -529,6 +575,101 @@ TEST(dispatch_ir_abort_emits_ir_done_for_aborted_send) {
     ASSERT_EQ(irGetCompletion(&t, &e), 1);
     ASSERT_EQ(t, token);
     ASSERT_EQ(e, IR_ENGINE_PF);
+    ASSERT_EQ(irGetCompletion(&t, &e), 0);
+}
+
+// Run the accepted request through the engine to completion, leaving its
+// IR_DONE queued but undrained — what the Timer 2 ISR produces when a burst
+// finishes before loop() gets to the drain step.
+static void run_burst_to_completion(void) {
+    irPoll();  // pending -> active
+    uint8_t cm; uint16_t ticks;
+    while (irNextPhase(&cm, &ticks)) { /* consume all envelope phases */ }
+    completionPending = 1;  // what the ISR does when irNextPhase returns 0
+}
+
+// Regression: a completed-but-undrained IR_DONE must survive an abort that
+// resolves another token in the same parse batch (it used to be overwritten
+// in the single completion slot and lost).
+TEST(dispatch_abort_preserves_undrained_completion) {
+    reset_firmware_state();
+    Packet pkt;
+    uint8_t p[] = {0, PF_MODE_COMBO_DIRECT, 0x01, 0x01};
+    uint8_t seq, cmd, payload[32], plen;
+
+    // Burst A: accepted and fully transmitted; completion not yet drained.
+    make_packet(&pkt, 0x60, CMD_PF_SEND, p, 4);
+    handlePacket(&pkt);
+    ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
+    ASSERT_EQ(cmd, REPLY_IR_ACCEPTED);
+    uint8_t tokenA = payload[0];
+    run_burst_to_completion();
+
+    // Same parse batch: a new send, then IR_ABORT_ALL.
+    reset_capture();
+    make_packet(&pkt, 0x61, CMD_PF_SEND, p, 4);
+    handlePacket(&pkt);
+    uint16_t pos = decode_frame_at(0, &seq, &cmd, payload, &plen);
+    ASSERT_TRUE(pos != 0);
+    ASSERT_EQ(cmd, REPLY_IR_ACCEPTED);
+    uint8_t tokenB = payload[0];
+
+    make_packet(&pkt, 0x62, CMD_IR_ABORT_ALL, NULL, 0);
+    handlePacket(&pkt);
+
+    // The abort handler must emit A's IR_DONE before resolving B's token...
+    pos = decode_frame_at(pos, &seq, &cmd, payload, &plen);
+    ASSERT_TRUE(pos != 0);
+    ASSERT_EQ(cmd, REPLY_IR_DONE);
+    ASSERT_EQ(seq, 0x00);
+    ASSERT_EQ(payload[0], tokenA);
+
+    pos = decode_frame_at(pos, &seq, &cmd, payload, &plen);
+    ASSERT_TRUE(pos != 0);
+    ASSERT_EQ(cmd, REPLY_OK);
+
+    // ...and B's token resolves through the completion slot as usual.
+    uint8_t t, e;
+    ASSERT_EQ(irGetCompletion(&t, &e), 1);
+    ASSERT_EQ(t, tokenB);
+    ASSERT_EQ(irGetCompletion(&t, &e), 0);
+}
+
+// Same scenario through CMD_RESET_STATE, which aborts via doResetState().
+TEST(dispatch_reset_state_preserves_undrained_completion) {
+    reset_firmware_state();
+    Packet pkt;
+    uint8_t p[] = {0, PF_MODE_COMBO_DIRECT, 0x01, 0x01};
+    uint8_t seq, cmd, payload[32], plen;
+
+    make_packet(&pkt, 0x70, CMD_PF_SEND, p, 4);
+    handlePacket(&pkt);
+    ASSERT_EQ(decode_first_reply(&seq, &cmd, payload, &plen), 1);
+    uint8_t tokenA = payload[0];
+    run_burst_to_completion();
+
+    reset_capture();
+    make_packet(&pkt, 0x71, CMD_PF_SEND, p, 4);
+    handlePacket(&pkt);
+    uint16_t pos = decode_frame_at(0, &seq, &cmd, payload, &plen);
+    ASSERT_TRUE(pos != 0);
+    uint8_t tokenB = payload[0];
+
+    make_packet(&pkt, 0x72, CMD_RESET_STATE, NULL, 0);
+    handlePacket(&pkt);
+
+    pos = decode_frame_at(pos, &seq, &cmd, payload, &plen);
+    ASSERT_TRUE(pos != 0);
+    ASSERT_EQ(cmd, REPLY_IR_DONE);
+    ASSERT_EQ(payload[0], tokenA);
+
+    pos = decode_frame_at(pos, &seq, &cmd, payload, &plen);
+    ASSERT_TRUE(pos != 0);
+    ASSERT_EQ(cmd, REPLY_OK);
+
+    uint8_t t, e;
+    ASSERT_EQ(irGetCompletion(&t, &e), 1);
+    ASSERT_EQ(t, tokenB);
     ASSERT_EQ(irGetCompletion(&t, &e), 0);
 }
 

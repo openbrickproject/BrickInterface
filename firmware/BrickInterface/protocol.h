@@ -71,7 +71,7 @@
 #define PROTO_VERSION_MAJOR     1
 #define PROTO_VERSION_MINOR     1
 #define FW_VERSION_MAJOR        0
-#define FW_VERSION_MINOR        6
+#define FW_VERSION_MINOR        7
 
 // --- PF modes ---
 #define PF_MODE_COMBO_DIRECT    0x00

@@ -26,9 +26,16 @@ void ifaceClearAllOutputs(void);
 // Pulled-up = HIGH = open = Logo "false".
 uint8_t ifaceSampleInputs(void);
 
+// Debounce window for the edge counters: a raw level change must hold this
+// long (ms) before it becomes the debounced state and can count. Filters
+// mechanical switch bounce (touch sensors) on both press and release. The
+// inputs have no hardware RC filtering, so this is the only debounce.
+#define IFACE_DEBOUNCE_MS 10
+
 // Edge counters for inputs 6 and 7.
 // Counts only false-to-true transitions in the LEGO TC Logo sense — i.e.
 // the wire pin going from HIGH (open / pullup) to LOW (closed / dark / pressed).
+// Transitions are debounced (IFACE_DEBOUNCE_MS); a bouncing contact counts once.
 //
 // `ifaceEdgePoll()` must be called from the main loop on every iteration.
 // `input` is the wire-level port number: 6 or 7.

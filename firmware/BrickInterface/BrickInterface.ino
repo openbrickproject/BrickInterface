@@ -18,6 +18,13 @@
 #include "interface_a.h"
 #include "act_led.h"
 
+#ifdef __SDCC
+// Core USBCDC helper with no public prototype: blocks (250 ms timeout) until
+// the armed EP2 IN transfer has been collected by the host. USBSerial_flush()
+// only ARMS the transfer and returns immediately — it does not wait.
+extern uint8_t USBSerial_wait_UpPoint2BusyFlag_clear(void);
+#endif
+
 // --- Capabilities for this board ---
 #define DEVICE_CAPS (CAP_INTERFACE_A | CAP_PF_IR | CAP_LEGACY_IR | CAP_IR_DONE_EVENTS | CAP_RCX_IR)
 
@@ -42,6 +49,7 @@ void actLedTick(void) {
 
 // --- Forward declarations ---
 static void handlePacket(const Packet *pkt);
+static void drainIrCompletion(void);
 static void doResetState(void);
 static void enterBootloader(void);
 static uint8_t isValidPFMode(uint8_t mode);
@@ -156,15 +164,24 @@ void loop() {
     }
 
     // IR completion events
+    drainIrCompletion();
+
+    actLedTick();
+    irPoll();
+    ifaceEdgePoll();
+}
+
+// ============================================================
+// Emit the queued IR completion event, if any. Called every loop() pass, and
+// by the abort paths in handlePacket BEFORE they resolve another token:
+// irAbortAll() writes through the single completion slot, so an undrained
+// IR_DONE would otherwise be overwritten and lost.
+static void drainIrCompletion(void) {
     uint8_t token, engine;
     if (irGetCompletion(&token, &engine)) {
         uint8_t payload[2] = { token, engine };
         sendReply(0x00, REPLY_IR_DONE, payload, 2);
     }
-
-    actLedTick();
-    irPoll();
-    ifaceEdgePoll();
 }
 
 // ============================================================
@@ -193,13 +210,18 @@ static void handlePacket(const Packet *pkt) {
     }
 
     case CMD_RESET_STATE:
+        drainIrCompletion();  // before the abort inside resolves another token
         doResetState();
         sendReply(pkt->seq, REPLY_OK, NULL, 0);
         break;
 
     case CMD_ENTER_BOOTLOADER:
         sendReply(pkt->seq, REPLY_OK, NULL, 0);
-        USBSerial_flush();  // block until USB IN ACK from host
+        // flush() only arms the EP2 IN transfer; wait for the host to
+        // actually collect it before enterBootloader() tears USB down,
+        // or the OK reply is lost.
+        USBSerial_flush();
+        USBSerial_wait_UpPoint2BusyFlag_clear();
         enterBootloader();
         break;
 
@@ -299,6 +321,7 @@ static void handlePacket(const Packet *pkt) {
 
     // --- IR abort ---
     case CMD_IR_ABORT_ALL:
+        drainIrCompletion();  // before irAbortAll resolves another token
         irAbortAll();
         sendReply(pkt->seq, REPLY_OK, NULL, 0);
         break;

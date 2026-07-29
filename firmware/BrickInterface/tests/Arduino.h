@@ -56,6 +56,7 @@ extern TestSerial Serial;  // shared buffer for tests to inspect
 inline uint8_t USBSerial_available(void) { return 0; }
 inline char USBSerial_read(void) { return 0; }
 inline void USBSerial_flush(void) {}
+inline uint8_t USBSerial_wait_UpPoint2BusyFlag_clear(void) { return 1; }
 uint8_t USBSerial_print_n(const uint8_t *buf, int len);
 uint8_t USBSerial_write(uint8_t c);
 

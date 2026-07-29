@@ -2,7 +2,7 @@
 
 Framed binary protocol over USB-CDC for driving **LEGO Interface A** (9750 control box) and **LEGO Power Functions** (38 kHz IR) from a host computer.
 
-- **Protocol version:** 1.1 · **Firmware version:** 0.6
+- **Protocol version:** 1.1 · **Firmware version:** 0.7
 - **Transport:** USB-CDC ACM virtual serial port (`/dev/cu.usbmodem*`, `/dev/ttyACM0`, `COM*`). Baud is irrelevant; open at any rate.
 - **USB identity:** VID `0x1209`, PID `0xC550`.
 - **Endianness:** all multi-byte fields little-endian.
@@ -134,7 +134,7 @@ Reports the state of the two inputs. Reply `IFACE_INPUTS` `state`: bit 0 = input
 
 ### `IFACE_GET_COUNTS` (`0x12`) / `IFACE_RESET_COUNT` (`0x13`)
 
-Each input has a free-running u32 edge counter. It counts the number of times the input's boolean state changes from false to true: one count per touch press, or per dark slice of an optosensor disk. Electrically that is a HIGH→LOW edge. The count wraps at 2³². `IFACE_GET_COUNTS` reports both counts as `count6` then `count7` (8 bytes). `IFACE_RESET_COUNT` clears one input's count. Its payload is the input number (`6` or `7`).
+Each input has a free-running u32 edge counter. It counts the number of times the input's boolean state changes from false to true: one count per touch press, or per dark slice of an optosensor disk. Electrically that is a HIGH→LOW edge. Transitions are debounced in firmware — a level must hold ~10 ms to register — so switch contact bounce counts once, and events shorter than 10 ms are not counted. The count wraps at 2³². `IFACE_GET_COUNTS` reports both counts as `count6` then `count7` (8 bytes). `IFACE_RESET_COUNT` clears one input's count. Its payload is the input number (`6` or `7`).
 
 ---
 

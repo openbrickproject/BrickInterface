@@ -1,0 +1,18 @@
+#!/usr/bin/env bricklogo
+connectto "powerfunctions "pf
+talkto ["red1 "blue1]
+on
+wait 50
+off
+rd
+on
+wait 50
+off
+rd
+talkto "red1
+onfor 10
+off
+rd
+talkto "blue1
+onfor 10
+off

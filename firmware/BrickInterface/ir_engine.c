@@ -371,8 +371,10 @@ void irAbortAll(void) {
     RCAP2L = T2_RELOAD_BASE_L;
     // Resolve the outstanding token, if any, so every IR_ACCEPTED produces
     // exactly one IR_DONE even when the burst is aborted. At most one of
-    // {state, pending} holds a token (single-slot queue); a completion that
-    // already fired but hasn't been drained by the main loop is left intact.
+    // {state, pending} holds a token (single-slot queue). NOTE: resolving
+    // writes through the single completion slot — callers that may run with
+    // an undrained completion (the dispatch abort/reset handlers) must drain
+    // it first or that IR_DONE is overwritten and lost.
     if (state.active != IR_ACTIVE_NONE) {
         completionToken = state.token;
         completionEngine = state.engine;
@@ -479,9 +481,13 @@ void irPoll(void) {
     // Prime the envelope state machine: the ISR counts envelopeTicks down
     // in silence (carrierMode=0), then loads the first phase. Set this
     // last so the ISR doesn't try to advance before state is fully
-    // initialized.
+    // initialized. The 16-bit store is two byte writes on the 8051; mask
+    // Timer 2 around it so the ISR can't observe (and decrement) a torn
+    // intermediate value.
     carrierMode = 0;
+    ET2 = 0;
     envelopeTicks = primeTicks;
+    ET2 = 1;
 }
 
 // --- Enqueue functions ---
