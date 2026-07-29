@@ -6,7 +6,7 @@ The host talks to the board with a framed binary protocol over USB-CDC, and the 
 
 ## Purchase BrickInterface
 
-While this repo contains everything you need to manufacture your own BrickInterface, there is a limited number available for purchase here:
+While this repo contains everything you need to manufacture your own BrickInterface, there is a limited number of pre-build boards available for purchase here:
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/s/d1e9300dc4)
 
