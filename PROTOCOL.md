@@ -1,6 +1,6 @@
 # BrickInterface Protocol
 
-Framed binary protocol over USB-CDC for driving **LEGO Interface A** (9750 control box) and **LEGO Power Functions** (38 kHz IR) from a host computer.
+Framed binary protocol over USB-CDC for driving a LEGO Interface A control box (9750) and LEGO Power Functions receivers (38 kHz IR) from a host computer.
 
 - **Protocol version:** 1.1 · **Firmware version:** 0.7
 - **Transport:** USB-CDC ACM virtual serial port (`/dev/cu.usbmodem*`, `/dev/ttyACM0`, `COM*`). Baud is irrelevant; open at any rate.
@@ -207,4 +207,4 @@ To stop a PF motor, resend with `data = 0x10` (B, float) or `0x18` (B, brake).
 ## References
 
 - [LEGO TC Logo Reference Guide](https://archive.org/details/lego-tc-logo-reference-guide). Reference for the Interface A (9750). It defines the output and input port model, the true/false sense of the touch and optosensors, and the edge-count behaviour reproduced here.
-- [LEGO Power Functions RC Protocol v1.20](http://images.groundzero.com.pt/LEGO_Power_Functions_RC_v120.pdf). The 38 kHz encoding and the toggle, escape, channel, mode, and data fields behind `PF_SEND`.
+- [LEGO Power Functions RC Protocol v1.20](http://images.groundzero.com.pt/LEGO_Power_Functions_RC_v120.pdf). The 38 kHz encoding and the toggle, escape, channel, mode, and data fields behind `PF_SEND`. Published by the LEGO Group for third-party use.

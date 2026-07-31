@@ -1,6 +1,6 @@
 # BrickInterface
 
-BrickInterface is a modern USB-C board that bridges vintage LEGO electronics where no official solution exists. As of now, it supports the **LEGO Interface A** and **LEGO Power Functions**.
+BrickInterface is a modern USB-C board that bridges vintage LEGO® electronics where no official solution exists. As of now, it supports the LEGO Interface A and LEGO Power Functions.
 
 The host talks to the board with a framed binary protocol over USB-CDC, and the board appears as a standard serial port.
 
@@ -81,3 +81,9 @@ This project is dual-licensed by component:
 - **Hardware** (the KiCad design, gerbers, and BOM in `kicad/`) is licensed under the **CERN Open Hardware Licence Version 2 – Permissive (CERN-OHL-P v2)**. See [`kicad/LICENSE`](kicad/LICENSE).
 
 Both are permissive licenses with a patent grant. Copyright 2024–2026 Nathan Kellenicki.
+
+## Trademarks
+
+LEGO® and Mindstorms are trademarks of the LEGO Group of companies, which does not sponsor, authorize, or endorse this project.
+
+BrickInterface is an independent, unofficial project. All product names, logos, and brands referenced in this project are the property of their respective owners. Use of these names is for identification and compatibility purposes only and does not imply any endorsement.
